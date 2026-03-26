@@ -1,0 +1,100 @@
+# Apptainer definition file for DrugCLIP molecular embedding extraction
+#
+# Builds a CUDA-capable container with:
+#   - Python 3.9, PyTorch 2.1.2 + CUDA 12.1
+#   - Uni-Core framework (fairseq-based, required by DrugCLIP)
+#   - DrugCLIP repo cloned to /drugclip
+#   - smiles_to_lmdb.py and extract_mol_embeddings.py bundled at /drugclip/
+#
+# Build (from repo root):
+#   apptainer build drugclip.sif scripts/drugclip_scripts/drugclip.def
+#
+# Upload to S3:
+#   aws s3 cp drugclip.sif s3://ai2050-ersilia-cluster/sif-files/drugclip.sif
+
+Bootstrap: docker
+From: nvidia/cuda:12.1.1-cudnn8-devel-ubuntu20.04
+
+# ── Bundle local scripts into the container ───────────────────────────────────
+# Paths are relative to the directory where `apptainer build` is run (repo root)
+%files
+    scripts/drugclip_scripts/smiles_to_lmdb.py          /drugclip/smiles_to_lmdb.py
+    scripts/drugclip_scripts/extract_mol_embeddings.py  /drugclip/extract_mol_embeddings.py
+
+# ── Build steps ───────────────────────────────────────────────────────────────
+%post
+    export DEBIAN_FRONTEND=noninteractive
+
+    # System packages
+    apt-get update -y && apt-get install -y \
+        git wget curl bzip2 ca-certificates \
+        libglib2.0-0 libxext6 libsm6 libxrender1 \
+        build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+    # ── Miniforge (Python 3.9, conda-forge — no Anaconda ToS) ─────────────
+    wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
+        -O /tmp/miniforge.sh
+    bash /tmp/miniforge.sh -b -p /opt/miniconda
+    rm /tmp/miniforge.sh
+
+    export PATH="/opt/miniconda/bin:$PATH"
+    conda install -y mamba -c conda-forge
+    mamba install -y python=3.9
+
+    # ── PyTorch 2.1.2 + CUDA 12.1 ──────────────────────────────────────────
+    pip install --no-cache-dir \
+        torch==2.1.2 torchvision==0.16.2 \
+        --index-url https://download.pytorch.org/whl/cu121
+
+    # ── RDKit via pip (avoids conda solver conflicts with Python 3.9) ──────
+    pip install --no-cache-dir rdkit==2022.9.5
+
+    # ── FAISS (via pip — cu121 build for GPU nodes, falls back gracefully) ──
+    pip install --no-cache-dir faiss-gpu-cu12 || \
+        pip install --no-cache-dir faiss-cpu
+
+    # ── Core scientific packages ────────────────────────────────────────────
+    pip install --no-cache-dir \
+        numpy scipy scikit-learn \
+        lmdb \
+        h5py \
+        tqdm \
+        biopython \
+        pandas
+
+    # ── Uni-Core (fairseq-based framework required by DrugCLIP) ────────────
+    pip install --no-cache-dir \
+        git+https://github.com/dptech-corp/Uni-Core.git
+
+    # ── Clone DrugCLIP repo ─────────────────────────────────────────────────
+    # The repo is cloned AFTER smiles_to_lmdb.py / extract_mol_embeddings.py
+    # are already placed at /drugclip/ via %files, so we clone to a temp
+    # location and merge only the repo files we need.
+    git clone --depth 1 https://github.com/bowen-gao/DrugCLIP.git /tmp/drugclip_repo
+    cp -r /tmp/drugclip_repo/unimol  /drugclip/unimol
+    cp -r /tmp/drugclip_repo/data    /drugclip/data
+    rm -rf /tmp/drugclip_repo
+
+    # Ensure /drugclip is importable as a Python package root
+    echo '/drugclip' > /opt/miniconda/lib/python3.9/site-packages/drugclip.pth
+
+    # Clean up conda cache
+    conda clean -afy
+
+# ── Runtime environment ───────────────────────────────────────────────────────
+%environment
+    export PATH="/opt/miniconda/bin:$PATH"
+    export PYTHONPATH="/drugclip:$PYTHONPATH"
+    # Suppress tokenizer parallelism warning
+    export TOKENIZERS_PARALLELISM=false
+
+# ── Default run: execute python with any arguments passed ─────────────────────
+%runscript
+    exec python "$@"
+
+# ── Labels ────────────────────────────────────────────────────────────────────
+%labels
+    Author ersilia
+    Version 1.0
+    Description DrugCLIP 128-dim molecular embedding extraction
