@@ -13,7 +13,7 @@ QUEUE=${3:-cpu-queue}
 
 if [ -z "$MODEL_ID" ] || [ -z "$LIBRARY_NAME" ]; then
     echo "Usage: $0 <model_id> <library_name> [queue]"
-    echo "Example: $0 eos4k4f_v1 Enamine_Hit_Locator_460K cpu-queue"
+    echo "Example: $0 eos4k4f_v1 Molport_Screening_Compounds_5.3M cpu-queue"
     exit 1
 fi
 
