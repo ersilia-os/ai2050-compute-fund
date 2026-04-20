@@ -1,6 +1,10 @@
 # Managed by Ersilia Version Control (eosvc)
 data/
 output/
+drugclip.sif
+debug_output/
+scripts/batch_job_scripts/
+Drug-The-Whole-Genome/
 
 # Manually added
 tmp/

@@ -1,184 +1,101 @@
 #!/bin/bash
-# Download DrugCLIP model weights and upload to S3.
+# Download DrugCLIP model weights from HuggingFace and upload to S3.
 #
 # Run this ONCE from your local machine (needs internet + AWS credentials).
-# The weights are then available to the cluster via S3.
+# The weights are already downloaded as model_weights.zip — this script
+# handles extraction and S3 upload.
 #
 # Usage:
 #   bash scripts/drugclip_scripts/download-drugclip-weights.sh
 #
-# Download strategy (tries in order):
-#   1. HuggingFace dataset THU-ATOM/DrugCLIP_data — benchmark_weights.zip
-#      (pretrained screening model — what we want for embedding)
-#   2. Google Drive folder (fallback, requires gdown)
-#      https://drive.google.com/drive/folders/1zW1MGpgunynFxTKXC2Q4RgWxZmg6CInV
+# Weights location:
+#   HuggingFace: bgao95/DrugCLIP_data — model_weights.zip
+#   Contains:    model_weights/6_folds/fold_0.pt ... fold_5.pt
+#
+# S3 destination:
+#   s3://ai2050-ersilia-cluster/drugclip-weights/model_weights/6_folds/fold_*.pt
 #
 # On cluster (one-time setup after this script):
-#   mkdir -p /shared/drugclip-weights
-#   aws s3 cp s3://ai2050-ersilia-cluster/drugclip-weights/checkpoint_best.pt \
-#       /shared/drugclip-weights/checkpoint_best.pt
+#   mkdir -p /shared/drugclip-weights/model_weights/6_folds
+#   aws s3 sync s3://ai2050-ersilia-cluster/drugclip-weights/model_weights/6_folds/ \
+#       /shared/drugclip-weights/model_weights/6_folds/
 
 set -e
 
 S3_BUCKET="${S3_BUCKET:-ai2050-ersilia-cluster}"
-S3_KEY="drugclip-weights/checkpoint_best.pt"
+S3_PREFIX="drugclip-weights/model_weights/6_folds"
 LOCAL_DIR="./drugclip-weights"
-WEIGHTS_FILE="${LOCAL_DIR}/checkpoint_best.pt"
+EXTRACTED_DIR="${LOCAL_DIR}/extracted/model_weights/6_folds"
 
 echo "=========================================="
-echo "DrugCLIP Weights Download"
+echo "DrugCLIP Weights Download & Upload"
 echo "=========================================="
 
-mkdir -p "$LOCAL_DIR"
+# ── Install huggingface_hub if needed ─────────────────────────────────────────
+pip install -q huggingface_hub
 
-# ── Install dependencies ──────────────────────────────────────────────────────
-pip install -q huggingface_hub gdown
+# ── Download model_weights.zip if not already present ────────────────────────
+ZIP_FILE="${LOCAL_DIR}/model_weights.zip"
 
-# ── Strategy 1: HuggingFace — download benchmark_weights.zip and extract ──────
-echo ""
-echo "Strategy 1: HuggingFace (THU-ATOM/DrugCLIP_data) ..."
-
-python3 - << 'PYEOF'
-import os, sys, zipfile
+if [ ! -f "$ZIP_FILE" ]; then
+    echo "Downloading model_weights.zip from HuggingFace (bgao95/DrugCLIP_data) ..."
+    mkdir -p "$LOCAL_DIR"
+    python3 - << 'PYEOF'
+import sys
 from huggingface_hub import hf_hub_download
 
-LOCAL_DIR = "./drugclip-weights"
-
-# The HuggingFace dataset has benchmark_weights.zip (pretrained screening model)
-# and model_weights.zip (wet-lab fine-tuned). We want benchmark_weights.zip.
-zip_candidates = [
-    ("THU-ATOM/DrugCLIP_data", "dataset", "benchmark_weights.zip"),
-    ("THU-ATOM/DrugCLIP_data", "dataset", "model_weights.zip"),
-]
-
-zip_path = None
-for repo_id, repo_type, filename in zip_candidates:
-    try:
-        print(f"  Trying {filename} ...")
-        zip_path = hf_hub_download(
-            repo_id=repo_id,
-            repo_type=repo_type,
-            filename=filename,
-            local_dir=LOCAL_DIR,
-        )
-        print(f"  Downloaded: {zip_path}")
-        break
-    except Exception as e:
-        print(f"  Not found: {e}")
-
-if zip_path is None:
-    print("  HuggingFace download failed — will try Google Drive next.")
-    sys.exit(1)
-
-# Extract and find checkpoint_best.pt
-print(f"  Extracting {zip_path} ...")
-with zipfile.ZipFile(zip_path, "r") as z:
-    names = z.namelist()
-    print(f"  ZIP contents: {names[:10]}")
-
-    # Find checkpoint_best.pt anywhere in the zip
-    ckpt_names = [n for n in names if os.path.basename(n) == "checkpoint_best.pt"]
-    if not ckpt_names:
-        print(f"  checkpoint_best.pt not found in ZIP. All files: {names}")
-        sys.exit(1)
-
-    # Use the first match (prefer shortest path = least nested)
-    ckpt_name = sorted(ckpt_names, key=len)[0]
-    print(f"  Extracting: {ckpt_name}")
-    source = z.open(ckpt_name)
-    dest   = os.path.join(LOCAL_DIR, "checkpoint_best.pt")
-    with open(dest, "wb") as f:
-        f.write(source.read())
-    print(f"  Saved to: {dest}")
-
-print("  HuggingFace download successful.")
-PYEOF
-
-HF_SUCCESS=$?
-
-# ── Strategy 2: Google Drive fallback ────────────────────────────────────────
-if [ $HF_SUCCESS -ne 0 ] || [ ! -f "$WEIGHTS_FILE" ]; then
-    echo ""
-    echo "Strategy 2: Google Drive (gdown) ..."
-    echo "  Folder: https://drive.google.com/drive/folders/1zW1MGpgunynFxTKXC2Q4RgWxZmg6CInV"
-    echo ""
-    echo "  Attempting to download checkpoint_best.pt from Google Drive folder ..."
-
-    # gdown folder download — downloads all files in the folder
-    python3 - << 'PYEOF'
-import os, sys, glob
-
 try:
-    import gdown
-except ImportError:
-    import subprocess
-    subprocess.check_call(["pip", "install", "-q", "gdown"])
-    import gdown
-
-LOCAL_DIR = "./drugclip-weights"
-FOLDER_ID = "1zW1MGpgunynFxTKXC2Q4RgWxZmg6CInV"
-
-print(f"  Downloading from Google Drive folder {FOLDER_ID} ...")
-try:
-    gdown.download_folder(
-        id=FOLDER_ID,
-        output=LOCAL_DIR,
-        quiet=False,
-        use_cookies=False,
+    path = hf_hub_download(
+        repo_id="bgao95/DrugCLIP_data",
+        repo_type="dataset",
+        filename="model_weights.zip",
+        local_dir="./drugclip-weights",
     )
+    print(f"Downloaded: {path}")
 except Exception as e:
-    print(f"  Folder download failed: {e}")
-    print("  Trying direct file download ...")
-    # Try common direct file IDs if folder fails
+    print(f"ERROR: {e}")
+    print()
+    print("Please download model_weights.zip manually from:")
+    print("  https://huggingface.co/datasets/bgao95/DrugCLIP_data")
+    print("and place it at: ./drugclip-weights/model_weights.zip")
     sys.exit(1)
-
-# Find checkpoint_best.pt in downloaded files
-matches = glob.glob(f"{LOCAL_DIR}/**/checkpoint_best.pt", recursive=True)
-if not matches:
-    print(f"  checkpoint_best.pt not found in downloaded files.")
-    print(f"  Files downloaded: {os.listdir(LOCAL_DIR)}")
-    sys.exit(1)
-
-src = matches[0]
-dst = os.path.join(LOCAL_DIR, "checkpoint_best.pt")
-if src != dst:
-    import shutil
-    shutil.copy2(src, dst)
-    print(f"  Copied {src} -> {dst}")
-
-print("  Google Drive download successful.")
 PYEOF
-
+else
+    echo "model_weights.zip already present: $ZIP_FILE"
 fi
 
-# ── Final check ───────────────────────────────────────────────────────────────
-if [ ! -f "$WEIGHTS_FILE" ]; then
-    echo ""
-    echo "ERROR: Automatic download failed."
-    echo ""
-    echo "Please download manually:"
-    echo "  1. Go to: https://drive.google.com/drive/folders/1zW1MGpgunynFxTKXC2Q4RgWxZmg6CInV"
-    echo "  2. Download checkpoint_best.pt"
-    echo "  3. Place it at: ${WEIGHTS_FILE}"
-    echo "  4. Then re-run this script from Step 'Upload to S3':"
-    echo "       aws s3 cp ${WEIGHTS_FILE} s3://${S3_BUCKET}/${S3_KEY}"
+# ── Extract fold weights ──────────────────────────────────────────────────────
+if [ ! -d "$EXTRACTED_DIR" ] || [ -z "$(ls -A $EXTRACTED_DIR 2>/dev/null)" ]; then
+    echo "Extracting model_weights.zip ..."
+    unzip -q "$ZIP_FILE" -d "${LOCAL_DIR}/extracted/"
+    echo "Extracted to: ${LOCAL_DIR}/extracted/"
+else
+    echo "Already extracted: $EXTRACTED_DIR"
+fi
+
+# Verify fold files exist
+echo ""
+echo "Fold weights found:"
+ls -lh "${EXTRACTED_DIR}"/fold_*.pt 2>/dev/null || {
+    echo "ERROR: fold_*.pt files not found in $EXTRACTED_DIR"
+    echo "Contents: $(ls ${LOCAL_DIR}/extracted/ 2>/dev/null)"
     exit 1
-fi
+}
 
-SIZE=$(du -h "$WEIGHTS_FILE" | cut -f1)
+# ── Upload all fold weights to S3 ────────────────────────────────────────────
 echo ""
-echo "Checkpoint ready: $WEIGHTS_FILE ($SIZE)"
+echo "Uploading fold weights to s3://${S3_BUCKET}/${S3_PREFIX}/ ..."
+aws s3 sync "${EXTRACTED_DIR}/" "s3://${S3_BUCKET}/${S3_PREFIX}/"
 
-# ── Upload to S3 ──────────────────────────────────────────────────────────────
 echo ""
-echo "Uploading to s3://${S3_BUCKET}/${S3_KEY} ..."
-aws s3 cp "$WEIGHTS_FILE" "s3://${S3_BUCKET}/${S3_KEY}"
-aws s3 ls "s3://${S3_BUCKET}/${S3_KEY}"
+echo "Verifying S3 upload ..."
+aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/"
 
 echo ""
 echo "=========================================="
 echo "Done. Next steps on the cluster:"
 echo "=========================================="
-echo "  mkdir -p /shared/drugclip-weights"
-echo "  aws s3 cp s3://${S3_BUCKET}/${S3_KEY} /shared/drugclip-weights/checkpoint_best.pt"
+echo "  mkdir -p /shared/drugclip-weights/model_weights/6_folds"
+echo "  aws s3 sync s3://${S3_BUCKET}/${S3_PREFIX}/ \\"
+echo "      /shared/drugclip-weights/model_weights/6_folds/"
 echo "=========================================="

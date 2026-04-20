@@ -49,14 +49,14 @@ def count_lmdb_molecules(input_file):
         return -1
 
 def count_h5_embeddings(h5_file):
-    """Count embeddings stored in an HDF5 file."""
+    """Count embeddings stored in an HDF5 file (DrugCLIP: mol_reps dataset, 768-dim)."""
     try:
         with h5py.File(h5_file, "r") as f:
-            if "embeddings" in f:
-                return f["embeddings"].shape[0]
-            # Fallback: check attrs
-            if "n_molecules" in f.attrs:
-                return int(f.attrs["n_molecules"])
+            if "mol_reps" in f:
+                shape = f["mol_reps"].shape
+                if shape[1] != 768:
+                    print(f"    WARNING: unexpected embedding dim {shape[1]} (expected 768)")
+                return shape[0]
         return -1
     except Exception as e:
         return -1

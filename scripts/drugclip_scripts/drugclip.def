@@ -1,10 +1,9 @@
 # Apptainer definition file for DrugCLIP molecular embedding extraction
 #
-# Builds a CUDA-capable container with:
-#   - Python 3.9, PyTorch 2.1.2 + CUDA 12.1
-#   - Uni-Core framework (fairseq-based, required by DrugCLIP)
-#   - DrugCLIP repo cloned to /drugclip
-#   - smiles_to_lmdb.py and extract_mol_embeddings.py bundled at /drugclip/
+# Bundles the Drug-The-Whole-Genome repo (unimol/ + dict/) and smiles_to_lmdb.py.
+# Model weights are NOT baked in — they are bind-mounted at runtime from
+#   /shared/drugclip-weights  →  /drugclip/data/model_weights
+# (satisfying the hardcoded path in drugclip.py:1474)
 #
 # Build (from repo root):
 #   apptainer build drugclip.sif scripts/drugclip_scripts/drugclip.def
@@ -15,11 +14,12 @@
 Bootstrap: docker
 From: nvidia/cuda:12.1.1-cudnn8-devel-ubuntu20.04
 
-# ── Bundle local scripts into the container ───────────────────────────────────
+# ── Bundle local files into the container ─────────────────────────────────────
 # Paths are relative to the directory where `apptainer build` is run (repo root)
 %files
+    Drug-The-Whole-Genome/unimol                        /drugclip/unimol
+    Drug-The-Whole-Genome/dict                          /drugclip/dict
     scripts/drugclip_scripts/smiles_to_lmdb.py          /drugclip/smiles_to_lmdb.py
-    scripts/drugclip_scripts/extract_mol_embeddings.py  /drugclip/extract_mol_embeddings.py
 
 # ── Build steps ───────────────────────────────────────────────────────────────
 %post
@@ -44,57 +44,56 @@ From: nvidia/cuda:12.1.1-cudnn8-devel-ubuntu20.04
 
     # ── PyTorch 2.1.2 + CUDA 12.1 ──────────────────────────────────────────
     pip install --no-cache-dir \
-        torch==2.1.2 torchvision==0.16.2 \
+        torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 \
         --index-url https://download.pytorch.org/whl/cu121
 
-    # ── RDKit via pip (avoids conda solver conflicts with Python 3.9) ──────
-    pip install --no-cache-dir rdkit==2022.9.5
+    # ── RDKit (version from Drug-The-Whole-Genome docker/requirements.txt) ─
+    pip install --no-cache-dir rdkit==2023.9.5
 
-    # ── FAISS (via pip — cu121 build for GPU nodes, falls back gracefully) ──
+    # ── FAISS (GPU build for CUDA 12) ───────────────────────────────────────
     pip install --no-cache-dir faiss-gpu-cu12 || \
         pip install --no-cache-dir faiss-cpu
 
     # ── Core scientific packages ────────────────────────────────────────────
     pip install --no-cache-dir \
-        numpy scipy scikit-learn \
+        numpy \
+        "scipy==1.10.1" \
+        "scikit-learn==1.2.2" \
+        "pandas==1.5.3" \
         lmdb \
+        zstandard \
         h5py \
         tqdm \
-        biopython \
-        pandas
+        biopython==1.81 \
+        biotite==0.37.0
 
     # ── Uni-Core (fairseq-based framework required by DrugCLIP) ────────────
     pip install --no-cache-dir \
         git+https://github.com/dptech-corp/Uni-Core.git
 
-    # ── Clone DrugCLIP repo ─────────────────────────────────────────────────
-    # The repo is cloned AFTER smiles_to_lmdb.py / extract_mol_embeddings.py
-    # are already placed at /drugclip/ via %files, so we clone to a temp
-    # location and merge only the repo files we need.
-    git clone --depth 1 https://github.com/bowen-gao/DrugCLIP.git /tmp/drugclip_repo
-    cp -r /tmp/drugclip_repo/unimol  /drugclip/unimol
-    cp -r /tmp/drugclip_repo/data    /drugclip/data
-    rm -rf /tmp/drugclip_repo
+    # ── Create data dir placeholder (weights bind-mounted at runtime) ───────
+    mkdir -p /drugclip/data/model_weights/6_folds
 
-    # Ensure /drugclip is importable as a Python package root
+    # ── Make unimol importable ───────────────────────────────────────────────
     echo '/drugclip' > /opt/miniconda/lib/python3.9/site-packages/drugclip.pth
 
-    # Clean up conda cache
+    # Clean conda cache
     conda clean -afy
 
 # ── Runtime environment ───────────────────────────────────────────────────────
 %environment
     export PATH="/opt/miniconda/bin:$PATH"
     export PYTHONPATH="/drugclip:$PYTHONPATH"
-    # Suppress tokenizer parallelism warning
     export TOKENIZERS_PARALLELISM=false
 
-# ── Default run: execute python with any arguments passed ─────────────────────
+# ── Default: run python from /drugclip working directory ─────────────────────
+# The hardcoded weight path ./data/model_weights/6_folds/ in drugclip.py
+# is resolved relative to CWD, so we must run from /drugclip.
 %runscript
+    cd /drugclip
     exec python "$@"
 
-# ── Labels ────────────────────────────────────────────────────────────────────
 %labels
     Author ersilia
-    Version 1.0
-    Description DrugCLIP 128-dim molecular embedding extraction
+    Version 2.0
+    Description DrugCLIP 768-dim molecular embedding extraction (6-fold ensemble)

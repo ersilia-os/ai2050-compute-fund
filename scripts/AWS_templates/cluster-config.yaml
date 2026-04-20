@@ -97,7 +97,7 @@ Scheduling:
     # ========================================
     - Name: gpu-queue
       CapacityType: SPOT
-      AllocationStrategy: lowest-price
+      AllocationStrategy: capacity-optimized
       Networking:
         SubnetIds:
           - subnet-0157f3ce5e347347c
@@ -107,9 +107,12 @@ Scheduling:
         PlacementGroup:
           Enabled: false
       ComputeResources:
-        # g5.4xlarge: 1x A10G GPU, ~$0.43/hr spot
-        - Name: gpu-g5-4xl
-          InstanceType: g5.4xlarge
+        # g6.4xlarge: 1x L4 GPU (24GB), 16 vCPU — primary
+        # g4dn.4xlarge: 1x T4 GPU (16GB), 16 vCPU — fallback
+        - Name: gpu-g6-4xl
+          Instances:
+            - InstanceType: g6.4xlarge
+            - InstanceType: g4dn.4xlarge
           MinCount: 0
           MaxCount: 10
       ComputeSettings:

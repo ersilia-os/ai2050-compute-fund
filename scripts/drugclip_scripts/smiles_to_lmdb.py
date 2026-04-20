@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Convert a SMILES CSV to LMDB format expected by DrugCLIP.
+Convert a SMILES CSV to LMDB format expected by DrugCLIP (LMDBDatasetV2).
 
 Generates a single 3D conformer per molecule using RDKit ETKDGv3.
 Invalid SMILES or molecules where 3D generation fails are skipped.
@@ -8,10 +8,14 @@ Invalid SMILES or molecules where 3D generation fails are skipped.
 Usage:
     python smiles_to_lmdb.py --input chunk.csv --output mols.lmdb
 
-LMDB format produced:
-    key:   b"0", b"1", ...  (sequential, only for successful molecules)
-    value: pickle({ "smi": str, "atoms": list[str], "coordinates": ndarray(1, N, 3) })
-    b"__len__": number of molecules written
+LMDB format produced (LMDBDatasetV2-compatible):
+    Named sub-database "data":
+        key:   "0", "1", ...  (sequential, only for successful molecules)
+        value: zstd-compressed pickle({ "smi": str, "atoms": list[str],
+                                        "coordinates": list[ndarray(N, 3)] })
+    Named sub-database "split":
+        key:   "success"
+        value: zstd-compressed b"0,1,2,..."  (comma-separated keys)
 """
 
 import argparse
@@ -23,6 +27,7 @@ from pathlib import Path
 
 import lmdb
 import numpy as np
+import zstandard as zstd
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
@@ -42,7 +47,7 @@ def smiles_to_atoms_coords(smi: str):
 
     Returns:
         atoms        : list[str]  — heavy-atom symbols (hydrogens removed)
-        coordinates  : ndarray    — shape (1, N, 3), single conformer
+        coordinates  : list       — [ndarray(N, 3)], single conformer wrapped in list
 
     Raises ValueError if SMILES is invalid or 3D generation fails.
     """
@@ -70,12 +75,12 @@ def smiles_to_atoms_coords(smi: str):
     atoms = [atom.GetSymbol() for atom in mol.GetAtoms()]
     coords = conf.GetPositions()  # (N, 3)
 
-    return atoms, coords[np.newaxis, :, :]  # (1, N, 3)
+    return atoms, [coords]  # list of one (N, 3) array — matches AffinityMolDataset expectation
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert SMILES CSV → LMDB for DrugCLIP"
+        description="Convert SMILES CSV → LMDB for DrugCLIP (LMDBDatasetV2 format)"
     )
     parser.add_argument("--input",      required=True,
                         help="Input CSV file (must have a SMILES column)")
@@ -112,9 +117,10 @@ def main():
     log.info(f"Input      : {input_path}  ({len(rows):,} rows, SMILES col: '{smiles_col}')")
     log.info(f"Output     : {output_path}")
 
-    # ── Write LMDB ───────────────────────────────────────────────────────────
+    # ── Write LMDB (LMDBDatasetV2 format) ───────────────────────────────────
     env = lmdb.open(
         str(output_path),
+        max_dbs=2,
         map_size=1099511627776,  # 1 TB virtual — actual disk use is much smaller
         readonly=False,
         lock=False,
@@ -122,8 +128,15 @@ def main():
         meminit=False,
     )
 
-    n_ok   = 0
-    n_fail = 0
+    split_db = env.open_db(b"split")
+    data_db  = env.open_db(b"data")
+
+    compressor = zstd.ZstdCompressor(level=3)
+
+    n_ok        = 0
+    n_fail      = 0
+    keys        = []
+    success_smiles = []   # SMILES of successfully processed molecules, in embedding order
 
     with env.begin(write=True) as txn:
         for row in rows:
@@ -139,18 +152,24 @@ def main():
                 n_fail += 1
                 continue
 
-            data = {
-                "smi":         smi,
-                "atoms":       atoms,
-                "coordinates": coordinates,
-            }
-            txn.put(str(n_ok).encode("ascii"), pickle.dumps(data))
+            key  = str(n_ok)
+            data = {"smi": smi, "atoms": atoms, "coordinates": coordinates}
+            txn.put(key.encode(), compressor.compress(pickle.dumps(data)), db=data_db)
+            keys.append(key)
+            success_smiles.append(smi)
             n_ok += 1
 
-        # Store molecule count — used by some LMDB dataset loaders
-        txn.put(b"__len__", str(n_ok).encode("ascii"))
+        # Write "success" split: comma-separated keys, zstd-compressed
+        split_value = ",".join(keys).encode()
+        txn.put(b"success", compressor.compress(split_value), db=split_db)
 
     env.close()
+
+    # Write companion SMILES index: one SMILES per line, same order as h5 rows
+    smiles_index_path = output_path.with_suffix(".smiles.txt")
+    with open(smiles_index_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(success_smiles) + ("\n" if success_smiles else ""))
+    log.info(f"SMILES index: {smiles_index_path}  ({n_ok:,} entries)")
 
     log.info(f"Done — {n_ok:,} written, {n_fail:,} skipped")
     if n_fail > 0:

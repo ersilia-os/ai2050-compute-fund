@@ -6,7 +6,7 @@
 #SBATCH --output=/shared/logs/drugclip-%j.out
 #SBATCH --error=/shared/logs/drugclip-%j.err
 
-# Process one SMILES chunk through DrugCLIP to produce 128-dim embeddings.
+# Process one SMILES chunk through DrugCLIP to produce 768-dim embeddings.
 #
 # Called by submit-drugclip.sh via:
 #   sbatch --partition=<queue> --array=0-N run-drugclip-job.sh <library_name> <chunk_list_file>
@@ -16,7 +16,12 @@
 #
 # Pipeline per chunk:
 #   1. smiles_to_lmdb.py  — SMILES CSV → LMDB (RDKit 3D conformers)
-#   2. extract_mol_embeddings.py — LMDB → HDF5 (128-dim DrugCLIP embeddings)
+#   2. encode_mols.py     — LMDB → HDF5 (768-dim DrugCLIP 6-fold ensemble embeddings)
+#
+# Weights are bind-mounted:
+#   /shared/drugclip-weights  →  /drugclip/data/model_weights
+# satisfying the hardcoded path in drugclip.py:
+#   ./data/model_weights/6_folds/fold_{i}.pt
 
 LIBRARY_NAME=$1
 CHUNK_LIST=$2
@@ -27,7 +32,7 @@ if [ -z "$LIBRARY_NAME" ] || [ -z "$CHUNK_LIST" ]; then
 fi
 
 SIF_FILE="/shared/sif-files/drugclip.sif"
-WEIGHTS="/shared/drugclip-weights/checkpoint_best.pt"
+WEIGHTS_DIR="/shared/drugclip-weights"
 OUTPUT_BASE="/fsx/output/${LIBRARY_NAME}/drugclip"
 
 # ── Pick input file by array index ───────────────────────────────────────────
@@ -62,9 +67,10 @@ if [ ! -f "$SIF_FILE" ]; then
     exit 1
 fi
 
-if [ ! -f "$WEIGHTS" ]; then
-    echo "ERROR: Weights not found: $WEIGHTS"
-    echo "  Run: aws s3 cp s3://ai2050-ersilia-cluster/drugclip-weights/checkpoint_best.pt $WEIGHTS"
+if [ ! -d "${WEIGHTS_DIR}/model_weights/6_folds" ]; then
+    echo "ERROR: Weights not found: ${WEIGHTS_DIR}/model_weights/6_folds/"
+    echo "  Run: aws s3 sync s3://ai2050-ersilia-cluster/drugclip-weights/model_weights/6_folds/ \\"
+    echo "       ${WEIGHTS_DIR}/model_weights/6_folds/"
     exit 1
 fi
 
@@ -75,28 +81,32 @@ fi
 
 mkdir -p "$OUTPUT_BASE"
 
-# ── GPU detection ─────────────────────────────────────────────────────────────
+# ── GPU/CPU detection ─────────────────────────────────────────────────────────
 if nvidia-smi &>/dev/null; then
-    CPU_FLAG=""
+    GPU_FLAG="--fp16"
+    NV_FLAG="--nv"
     echo "Device: GPU ($(nvidia-smi --query-gpu=name --format=csv,noheader | head -1))"
 else
-    CPU_FLAG="--cpu"
+    GPU_FLAG="--cpu"
+    NV_FLAG=""
     echo "Device: CPU (no GPU detected)"
 fi
 
 # ── Temp workspace ────────────────────────────────────────────────────────────
 TMP_DIR=$(mktemp -d /tmp/drugclip_${SLURM_JOB_ID}_XXXX)
 LMDB_PATH="${TMP_DIR}/mols.lmdb"
-EMB_CACHE="${TMP_DIR}/emb_cache"
+TMP_OUTPUT="${TMP_DIR}/embeddings"
+mkdir -p "$TMP_OUTPUT"
 trap "rm -rf ${TMP_DIR}" EXIT
 
+# ── Step 1: SMILES CSV → LMDB ────────────────────────────────────────────────
 echo ""
 echo "Step 1/2 — Converting SMILES CSV → LMDB ..."
 echo "  Input : $INPUT_FILE"
 echo "  Output: $LMDB_PATH"
 
 apptainer exec \
-    --nv \
+    $NV_FLAG \
     --bind /fsx:/fsx \
     --bind /shared:/shared \
     --bind "${TMP_DIR}:${TMP_DIR}" \
@@ -110,35 +120,60 @@ if [ ! -d "$LMDB_PATH" ]; then
     exit 1
 fi
 
+# ── Step 2: LMDB → HDF5 (768-dim 6-fold embeddings) ─────────────────────────
 echo ""
 echo "Step 2/2 — Extracting DrugCLIP embeddings ..."
 echo "  Input  : $LMDB_PATH"
-echo "  Output : $OUTPUT_FILE"
+echo "  Output : $TMP_OUTPUT/mol_reps.h5"
 
 apptainer exec \
-    --nv \
+    $NV_FLAG \
+    --pwd /drugclip \
     --bind /fsx:/fsx \
     --bind /shared:/shared \
     --bind "${TMP_DIR}:${TMP_DIR}" \
+    --bind "${WEIGHTS_DIR}:/drugclip/data/model_weights" \
     "$SIF_FILE" \
-    python /drugclip/extract_mol_embeddings.py \
-        --lmdb        "$LMDB_PATH" \
-        --checkpoint  "$WEIGHTS" \
-        --output      "$OUTPUT_FILE" \
-        --dict-dir    /drugclip/data \
-        --batch-size  256 \
-        --emb-cache   "$EMB_CACHE" \
-        $CPU_FLAG
+    python /drugclip/unimol/encode_mols.py \
+        --user-dir /drugclip/unimol \
+        /drugclip/dict \
+        --valid-subset test \
+        --num-workers 0 --ddp-backend=c10d --batch-size 256 \
+        --task drugclip --loss in_batch_softmax --arch drugclip \
+        --max-pocket-atoms 256 --seed 1 \
+        --log-interval 100 --log-format simple \
+        --mol-path "$LMDB_PATH" \
+        --save-dir "$TMP_OUTPUT" \
+        --write-h5 \
+        $GPU_FLAG
 
-if [ -f "$OUTPUT_FILE" ]; then
-    SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
-    echo ""
-    echo "SUCCESS: $OUTPUT_FILE ($SIZE)"
-else
-    echo "ERROR: Output HDF5 was not created"
+# ── Move output to final path ─────────────────────────────────────────────────
+# encode_mols.py outputs: mol_reps.h5 (no start/end → no suffix)
+TMP_H5="${TMP_OUTPUT}/mol_reps.h5"
+
+if [ ! -f "$TMP_H5" ]; then
+    # Try with empty start/end suffix just in case
+    TMP_H5=$(ls "${TMP_OUTPUT}"/mol_reps*.h5 2>/dev/null | head -1)
+fi
+
+if [ -z "$TMP_H5" ] || [ ! -f "$TMP_H5" ]; then
+    echo "ERROR: Output HDF5 not found in $TMP_OUTPUT"
+    ls -la "$TMP_OUTPUT" || true
     exit 1
 fi
 
+mv "$TMP_H5" "$OUTPUT_FILE"
+
+# Move companion SMILES index (same row order as h5 embeddings)
+TMP_SMILES="${LMDB_PATH%.lmdb}.smiles.txt"
+if [ -f "$TMP_SMILES" ]; then
+    mv "$TMP_SMILES" "${OUTPUT_BASE}/${LIBRARY_NAME}_drugclip_${CHUNK_NUM}.smiles.txt"
+fi
+
+SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
+
+echo ""
+echo "SUCCESS: $OUTPUT_FILE ($SIZE)"
 echo "=========================================="
 echo "Job completed: $(date)"
 echo "=========================================="

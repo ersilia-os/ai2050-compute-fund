@@ -38,9 +38,9 @@ if [ ! -f "/shared/sif-files/drugclip.sif" ]; then
     exit 1
 fi
 
-if [ ! -f "/shared/drugclip-weights/checkpoint_best.pt" ]; then
-    echo "ERROR: Weights not found at /shared/drugclip-weights/checkpoint_best.pt"
-    echo "  Download: aws s3 cp s3://${S3_BUCKET}/drugclip-weights/checkpoint_best.pt /shared/drugclip-weights/"
+if [ ! -f "/shared/drugclip-weights/model_weights/6_folds/fold_0.pt" ]; then
+    echo "ERROR: Weights not found at /shared/drugclip-weights/model_weights/6_folds/fold_0.pt"
+    echo "  Download: aws s3 sync s3://${S3_BUCKET}/drugclip-weights/model_weights/6_folds/ /shared/drugclip-weights/model_weights/6_folds/"
     exit 1
 fi
 
