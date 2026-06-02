@@ -1,0 +1,107 @@
+# Apptainer definition file for DrugCLIP pocket encoding
+#
+# Builds a CUDA-capable container with:
+#   - Python 3.9, PyTorch 2.1.2 + CUDA 12.1
+#   - Uni-Core framework (fairseq-based, required by DrugCLIP)
+#   - DrugCLIP repo cloned to /drugclip
+#   - encode_pockets.py bundled at /drugclip/unimol/ (overrides upstream)
+#   - dict_pkt.txt bundled at /drugclip/data/ and /drugclip/dict/
+#
+# Input expected at runtime:
+#   A directory of co-crystallized PDB files named {anything}_{LIGAND}.pdb
+#   e.g. protein1_ATP.pdb, protein2_NAD.pdb
+#
+# Build (from repo root):
+#   apptainer build drugclip_pocket.sif scripts/drugclip_scripts/drugclip_pocket.def
+#
+# Upload to S3:
+#   aws s3 cp drugclip_pocket.sif s3://ai2050-ersilia-cluster/sif-files/drugclip_pocket.sif
+
+Bootstrap: docker
+From: nvidia/cuda:12.1.1-cudnn8-devel-ubuntu20.04
+
+# ── Bundle local files into the container ─────────────────────────────────────
+# Staged to /tmp/ so the git clone in %post does not overwrite them.
+# Paths are relative to the directory where `apptainer build` is run (repo root).
+%files
+    Drug-The-Whole-Genome/unimol/encode_pockets.py  /tmp/encode_pockets_local.py
+    Drug-The-Whole-Genome/dict/dict_pkt.txt          /tmp/dict_pkt.txt
+
+# ── Build steps ───────────────────────────────────────────────────────────────
+%post
+    export DEBIAN_FRONTEND=noninteractive
+
+    # System packages
+    apt-get update -y && apt-get install -y \
+        git wget curl bzip2 ca-certificates \
+        libglib2.0-0 libxext6 libsm6 libxrender1 \
+        build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+    # ── Miniforge (Python 3.9, conda-forge — no Anaconda ToS) ─────────────
+    wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
+        -O /tmp/miniforge.sh
+    bash /tmp/miniforge.sh -b -p /opt/miniconda
+    rm /tmp/miniforge.sh
+
+    export PATH="/opt/miniconda/bin:$PATH"
+    conda install -y mamba -c conda-forge
+    mamba install -y python=3.9
+
+    # ── PyTorch 2.1.2 + CUDA 12.1 ──────────────────────────────────────────
+    pip install --no-cache-dir \
+        torch==2.1.2 torchvision==0.16.2 \
+        --index-url https://download.pytorch.org/whl/cu121
+
+    # ── RDKit (used by encode_pockets.py for BEDROC/AUC scoring imports) ───
+    pip install --no-cache-dir rdkit==2022.9.5
+
+    # ── Core scientific packages ────────────────────────────────────────────
+    pip install --no-cache-dir \
+        numpy scipy scikit-learn \
+        lmdb \
+        tqdm \
+        biopython \
+        pandas
+
+    # ── Uni-Core (fairseq-based framework required by DrugCLIP) ────────────
+    pip install --no-cache-dir \
+        git+https://github.com/dptech-corp/Uni-Core.git
+
+    # ── Clone DrugCLIP repo ─────────────────────────────────────────────────
+    git clone --depth 1 https://github.com/bowen-gao/DrugCLIP.git /tmp/drugclip_repo
+    mkdir -p /drugclip
+    cp -r /tmp/drugclip_repo/unimol  /drugclip/unimol
+    cp -r /tmp/drugclip_repo/data    /drugclip/data
+    rm -rf /tmp/drugclip_repo
+
+    # ── Override encode_pockets.py with our local version ──────────────────
+    # Our version may have fixes relative to upstream (e.g. checkpoint loading).
+    cp /tmp/encode_pockets_local.py /drugclip/unimol/encode_pockets.py
+
+    # ── Place pocket dictionary where Uni-Core data loader expects it ───────
+    mkdir -p /drugclip/dict
+    cp /tmp/dict_pkt.txt /drugclip/data/dict_pkt.txt
+    cp /tmp/dict_pkt.txt /drugclip/dict/dict_pkt.txt
+
+    # Ensure /drugclip is importable as a Python package root
+    echo '/drugclip' > /opt/miniconda/lib/python3.9/site-packages/drugclip.pth
+
+    # Clean up
+    conda clean -afy
+
+# ── Runtime environment ───────────────────────────────────────────────────────
+%environment
+    export PATH="/opt/miniconda/bin:$PATH"
+    export PYTHONPATH="/drugclip:$PYTHONPATH"
+    export TOKENIZERS_PARALLELISM=false
+
+# ── Default run: execute python with any arguments passed ─────────────────────
+%runscript
+    exec python "$@"
+
+# ── Labels ────────────────────────────────────────────────────────────────────
+%labels
+    Author ersilia
+    Version 1.0
+    Description DrugCLIP pocket embedding extraction (128-dim vectors per binding pocket)
