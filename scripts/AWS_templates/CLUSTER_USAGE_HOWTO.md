@@ -252,6 +252,7 @@ The cpu-queue is configured with 4 instance types (`c6i.8xlarge`, `c7i.8xlarge`,
 sudo tail -f /var/log/parallelcluster/slurm_resume.log
 ```
 
+
 ---
 
 ### **Cluster Config Update (e.g. adding instance types)**

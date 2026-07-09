@@ -31,13 +31,6 @@ import pickle
 import sys
 from pathlib import Path
 
-try:
-    import h5py
-except ImportError:
-    import subprocess
-    subprocess.check_call(["/shared/python39/bin/pip", "install", "h5py", "-q"])
-    import h5py
-
 libraries = [$(printf '"%s",' "${LIBRARIES[@]}")]
 
 def count_lmdb_molecules(input_file):
@@ -48,17 +41,12 @@ def count_lmdb_molecules(input_file):
     except Exception:
         return -1
 
-def count_h5_embeddings(h5_file):
-    """Count embeddings stored in an HDF5 file (DrugCLIP: mol_reps dataset, 768-dim)."""
+def count_csv_rows(csv_file):
+    """Count data rows in a CSV file (minus header)."""
     try:
-        with h5py.File(h5_file, "r") as f:
-            if "mol_reps" in f:
-                shape = f["mol_reps"].shape
-                if shape[1] != 768:
-                    print(f"    WARNING: unexpected embedding dim {shape[1]} (expected 768)")
-                return shape[0]
-        return -1
-    except Exception as e:
+        with open(csv_file) as f:
+            return sum(1 for _ in f) - 1
+    except Exception:
         return -1
 
 print()
@@ -100,14 +88,14 @@ for library in libraries:
 
     for input_file in input_chunks:
         chunk_num   = input_file.stem.split("_")[-1]
-        output_file = output_dir / f"{library}_drugclip_{chunk_num}.h5"
+        output_file = output_dir / f"{library}_drugclip_{chunk_num}.csv"
 
         if not output_file.exists():
             missing_chunks.append(chunk_num)
             continue
 
         in_rows  = count_lmdb_molecules(input_file)
-        out_rows = count_h5_embeddings(output_file)
+        out_rows = count_csv_rows(output_file)
 
         if in_rows < 0 or out_rows < 0:
             mismatch_chunks.append(chunk_num)

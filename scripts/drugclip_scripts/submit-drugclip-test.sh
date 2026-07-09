@@ -12,7 +12,7 @@
 # What it does:
 #   1. Downloads test_smiles_100.csv from S3 to /fsx/input/test/
 #   2. Submits a single DrugCLIP job (not an array)
-#   3. Output: /fsx/output/test/drugclip/test_drugclip_000.h5
+#   3. Output: /fsx/output/test/drugclip/test_drugclip_000.csv (+ .h5, .smiles.txt)
 
 QUEUE=${1:-gpu-queue}
 
@@ -38,9 +38,9 @@ if [ ! -f "/shared/sif-files/drugclip.sif" ]; then
     exit 1
 fi
 
-if [ ! -f "/shared/drugclip-weights/model_weights/6_folds/fold_0.pt" ]; then
-    echo "ERROR: Weights not found at /shared/drugclip-weights/model_weights/6_folds/fold_0.pt"
-    echo "  Download: aws s3 sync s3://${S3_BUCKET}/drugclip-weights/model_weights/6_folds/ /shared/drugclip-weights/model_weights/6_folds/"
+if [ ! -f "/shared/drugclip-weights/6_folds/fold_0.pt" ]; then
+    echo "ERROR: Weights not found at /shared/drugclip-weights/6_folds/fold_0.pt"
+    echo "  Download: aws s3 sync s3://${S3_BUCKET}/drugclip-weights/model_weights/6_folds/ /shared/drugclip-weights/6_folds/"
     exit 1
 fi
 
@@ -85,11 +85,13 @@ echo ""
 echo "View log:"
 echo "  tail -f /shared/logs/drugclip-${JOB_ID}.out"
 echo ""
-echo "Check output when done:"
-echo "  python3 -c \""
-echo "    import h5py"
-echo "    f = h5py.File('${TEST_OUTPUT_FILE}', 'r')"
-echo "    print('Embeddings shape:', f['embeddings'].shape)"
-echo "    print('First SMILES:', f['smiles'][0])"
+echo "Check output when done (CSV — primary output):"
+echo "  head -1 ${TEST_OUTPUT_DIR}/test_drugclip_000.csv | tr ',' '\n' | head -5"
+echo "  wc -l ${TEST_OUTPUT_DIR}/test_drugclip_000.csv"
+echo ""
+echo "Check HDF5 embeddings:"
+echo "  /shared/python39/bin/python3.9 -c \""
+echo "    import h5py; f = h5py.File('${TEST_OUTPUT_FILE}', 'r')"
+echo "    print('mol_reps shape:', f['mol_reps'].shape)"
 echo "  \""
 echo "=========================================="

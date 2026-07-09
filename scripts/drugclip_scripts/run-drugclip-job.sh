@@ -2,9 +2,10 @@
 #SBATCH --job-name=drugclip
 #SBATCH --partition=gpu-queue
 #SBATCH --nodes=1
-#SBATCH --time=04:00:00
-#SBATCH --output=/shared/logs/drugclip-%j.out
-#SBATCH --error=/shared/logs/drugclip-%j.err
+#SBATCH --time=2-00:00:00
+#SBATCH --output=/shared/logs/drugclip-%A_%a.out
+#SBATCH --error=/shared/logs/drugclip-%A_%a.err
+#SBATCH --open-mode=append
 
 # Process one SMILES chunk through DrugCLIP to produce 768-dim embeddings.
 #
@@ -46,6 +47,7 @@ fi
 # Extract zero-padded chunk number: Library_chunk_042.csv → 042
 CHUNK_NUM=$(basename "$INPUT_FILE" .csv | grep -oP '\d+$')
 OUTPUT_FILE="${OUTPUT_BASE}/${LIBRARY_NAME}_drugclip_${CHUNK_NUM}.h5"
+CSV_OUTPUT="${OUTPUT_BASE}/${LIBRARY_NAME}_drugclip_${CHUNK_NUM}.csv"
 
 echo "=========================================="
 echo "DrugCLIP Embedding Job"
@@ -162,15 +164,92 @@ if [ -z "$TMP_H5" ] || [ ! -f "$TMP_H5" ]; then
     exit 1
 fi
 
+# Validate H5 is not empty before accepting it
+N_EMBEDDINGS=$(/shared/python39/bin/python3.9 -c "
+import h5py, sys
+try:
+    with h5py.File('$TMP_H5', 'r') as f:
+        print(f['mol_reps'].shape[0])
+except Exception:
+    print(0)
+" 2>/dev/null)
+
+if [ -z "$N_EMBEDDINGS" ] || [ "$N_EMBEDDINGS" -le 0 ]; then
+    echo "WARNING: HDF5 is empty — launching bisect for chunk $CHUNK_NUM"
+
+    BISECT_DIR="${OUTPUT_BASE}/bisect_${CHUNK_NUM}"
+    mkdir -p "$BISECT_DIR"
+    QUEUE=${SLURM_JOB_PARTITION:-gpu-queue}
+
+    # Split into 2 sub-chunks
+    TASKS_FILE="${BISECT_DIR}/tasks_initial.txt"
+    /shared/python39/bin/python3.9 - "$INPUT_FILE" "$BISECT_DIR" "$TASKS_FILE" << 'PYEOF'
+import csv, sys, os
+with open(sys.argv[1], newline="") as f:
+    reader = csv.DictReader(f)
+    rows = list(reader)
+    fn = reader.fieldnames
+bisect_dir, tasks_file = sys.argv[2], sys.argv[3]
+half = (len(rows) + 1) // 2
+with open(tasks_file, "w") as tf:
+    for i, piece in enumerate([rows[:half], rows[half:]]):
+        if not piece:
+            continue
+        path = os.path.join(bisect_dir, f"sub_p{i}.csv")
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fn)
+            w.writeheader()
+            w.writerows(piece)
+        tf.write(path + "\n")
+        print(f"  piece {i}: {os.path.basename(path)} ({len(piece)} molecules)")
+PYEOF
+
+    N_TASKS=$(wc -l < "$TASKS_FILE" | tr -d ' ')
+    JOB_OUTPUT=$(sbatch \
+        --partition="$QUEUE" \
+        --array=0-$((N_TASKS-1)) \
+        --job-name="drugclip-bisect" \
+        /shared/scripts/drugclip_scripts/run-drugclip-bisect.sh \
+        "$LIBRARY_NAME" "$CHUNK_NUM" "$BISECT_DIR" "$TASKS_FILE" "$QUEUE")
+
+    JOB_ID=$(echo "$JOB_OUTPUT" | grep -oP '\d+$' || true)
+    if [ -z "$JOB_ID" ]; then
+        echo "ERROR: bisect submission failed: $JOB_OUTPUT"
+        exit 1
+    fi
+    echo "→ Submitted bisect job $JOB_ID ($N_TASKS tasks) for chunk $CHUNK_NUM"
+    echo "  Bisect dir : $BISECT_DIR"
+    echo "  Merge when done: bash /shared/scripts/drugclip_scripts/merge-drugclip-bisect.sh $LIBRARY_NAME $CHUNK_NUM"
+    exit 0
+fi
+
+echo "  Embeddings: $N_EMBEDDINGS rows"
 mv "$TMP_H5" "$OUTPUT_FILE"
 
 # Move companion SMILES index (same row order as h5 embeddings)
 TMP_SMILES="${LMDB_PATH%.lmdb}.smiles.txt"
+SMILES_INDEX="${OUTPUT_BASE}/${LIBRARY_NAME}_drugclip_${CHUNK_NUM}.smiles.txt"
 if [ -f "$TMP_SMILES" ]; then
-    mv "$TMP_SMILES" "${OUTPUT_BASE}/${LIBRARY_NAME}_drugclip_${CHUNK_NUM}.smiles.txt"
+    mv "$TMP_SMILES" "$SMILES_INDEX"
 fi
 
 SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
+
+# ── Step 3: HDF5 + SMILES index → ersilia-format CSV ─────────────────────────
+echo ""
+echo "Step 3/3 — Converting to ersilia CSV format ..."
+
+if [ ! -f "$SMILES_INDEX" ]; then
+    echo "WARNING: SMILES index not found ($SMILES_INDEX) — skipping CSV conversion"
+else
+    /shared/python39/bin/python3.9 /shared/scripts/drugclip_scripts/h5_to_csv.py \
+        --input        "$INPUT_FILE" \
+        --h5           "$OUTPUT_FILE" \
+        --smiles-index "$SMILES_INDEX" \
+        --output       "$CSV_OUTPUT" \
+    && echo "  CSV: $CSV_OUTPUT ($(du -h "$CSV_OUTPUT" | cut -f1))" \
+    || echo "ERROR: CSV conversion failed (h5 is still available at $OUTPUT_FILE)"
+fi
 
 echo ""
 echo "SUCCESS: $OUTPUT_FILE ($SIZE)"

@@ -2,6 +2,7 @@
 data/
 output/
 drugclip.sif
+drugclip_pocket.sif
 debug_output/
 scripts/batch_job_scripts/
 Drug-The-Whole-Genome/
@@ -10,6 +11,7 @@ Drug-The-Whole-Genome/
 tmp/
 .DS_Store
 .vscode/
+scripts/transfer/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -1,10 +1,12 @@
 #!/bin/bash
-# Check input vs output line counts for all libraries for a given model
-# Reports missing chunks and chunks with fully-empty result rows
-# Usage: check-results.sh <model_id>
+# Check input vs output line counts for all libraries for a given model.
+# Reports missing chunks and chunks with fully-empty result rows.
 #
-# Example:
-#   check-results.sh eos4k4f_v1
+# Row counts use wc -l (fast, no Python file I/O).
+# Empty row detection uses awk (fast, single pass per library).
+#
+# Usage: check-results.sh <model_id>
+# Example: check-results.sh eos4k4f_v1
 
 MODEL_ID=$1
 
@@ -22,101 +24,179 @@ LIBRARIES=(
     "Enamine_Real_Sample_10.4M"
 )
 
-/shared/python39/bin/python3.9 << EOF
-import csv
-from pathlib import Path
+INPUT_COLS="key input smiles canonical_smiles"
 
-csv.field_size_limit(10 * 1024 * 1024)
+echo ""
+echo "Model: ${MODEL_ID}"
+printf "=%.0s" {1..75}; echo ""
+printf "%-45s %7s %8s %11s %7s\n" "Library" "Chunks" "Missing" "Empty rows" "Done"
+printf -- "-%.0s" {1..75}; echo ""
 
-INPUT_COLS = {"key", "input", "smiles", "canonical_smiles"}
+for LIBRARY in "${LIBRARIES[@]}"; do
+    INPUT_DIR="/fsx/input/${LIBRARY}"
+    OUTPUT_DIR="/fsx/output/${LIBRARY}/${MODEL_ID}"
 
-model_id  = "${MODEL_ID}"
-libraries = [$(printf '"%s",' "${LIBRARIES[@]}")]
-
-def check_chunk_empties(output_file, input_cols):
-    """Return count of rows where ALL result columns are empty."""
-    empty_rows = 0
-    result_cols = None
-    try:
-        with open(output_file, newline="") as fh:
-            reader = csv.DictReader(fh)
-            if reader.fieldnames:
-                result_cols = [c for c in reader.fieldnames
-                               if c.strip().lower() not in input_cols]
-            for row in reader:
-                if result_cols and all(row.get(c, "").strip() == "" for c in result_cols):
-                    empty_rows += 1
-    except Exception as e:
-        print(f"    WARNING: could not read {output_file.name}: {e}")
-    return empty_rows
-
-print()
-print(f"Model: {model_id}")
-print("=" * 75)
-print(f"{'Library':<45} {'Chunks':>7} {'Missing':>8} {'Empty rows':>11} {'Done':>7}")
-print("-" * 75)
-
-for library in libraries:
-    input_dir  = Path(f"/fsx/input/{library}")
-    output_dir = Path(f"/fsx/output/{library}/{model_id}")
-
-    if not input_dir.exists() or not output_dir.exists():
-        print(f"{library:<45} {'—':>7} {'—':>8} {'—':>11} {'NOT RUN':>7}")
+    if [ ! -d "$INPUT_DIR" ] || [ ! -d "$OUTPUT_DIR" ]; then
+        printf "%-45s %7s %8s %11s %7s\n" "$LIBRARY" "—" "—" "—" "NOT RUN"
         continue
+    fi
 
-    input_chunks = sorted(input_dir.glob("*_chunk_*.csv"))
-    if not input_chunks:
-        print(f"{library:<45} {'—':>7} {'—':>8} {'—':>11} {'NO INPUT':>7}")
+    mapfile -t INPUT_CHUNKS < <(ls "${INPUT_DIR}"/*_chunk_*.csv 2>/dev/null | sort)
+    TOTAL=${#INPUT_CHUNKS[@]}
+
+    if [ "$TOTAL" -eq 0 ]; then
+        printf "%-45s %7s %8s %11s %7s\n" "$LIBRARY" "—" "—" "—" "NO INPUT"
         continue
+    fi
 
-    missing_chunks = []
-    mismatch_chunks = []
-    empty_chunks = []   # (chunk_num, empty_row_count)
-    done = 0
+    # ── Collect present output files and their chunk numbers ──────────────────
+    MISSING_CHUNKS=()
+    MISMATCH_CHUNKS=()
+    PRESENT_OUTPUT_FILES=()
+    PRESENT_CHUNK_NUMS=()
 
-    for input_file in input_chunks:
-        chunk_num   = input_file.stem.split("_")[-1]
-        output_file = output_dir / f"{model_id}_results_{chunk_num}.csv"
+    for INPUT_FILE in "${INPUT_CHUNKS[@]}"; do
+        CHUNK_NUM=$(basename "$INPUT_FILE" .csv | grep -oP '\d+$')
+        OUTPUT_FILE="${OUTPUT_DIR}/${MODEL_ID}_results_${CHUNK_NUM}.csv"
 
-        if not output_file.exists():
-            missing_chunks.append(chunk_num)
-            continue
+        if [ ! -f "$OUTPUT_FILE" ]; then
+            MISSING_CHUNKS+=("$CHUNK_NUM")
+        else
+            PRESENT_OUTPUT_FILES+=("$OUTPUT_FILE")
+            PRESENT_CHUNK_NUMS+=("$CHUNK_NUM")
+        fi
+    done
 
-        in_rows  = sum(1 for _ in input_file.open()) - 1
-        out_rows = sum(1 for _ in output_file.open()) - 1
+    # ── Fast row counts via wc -l (one call for all input, one for all output) ─
+    DONE=0
+    declare -A IN_COUNTS OUT_COUNTS
 
-        if in_rows != out_rows:
-            mismatch_chunks.append(chunk_num)
-        else:
-            done += 1
+    if [ ${#PRESENT_OUTPUT_FILES[@]} -gt 0 ]; then
+        # Input counts for present chunks only
+        PRESENT_INPUT_FILES=()
+        for CHUNK_NUM in "${PRESENT_CHUNK_NUMS[@]}"; do
+            for INPUT_FILE in "${INPUT_CHUNKS[@]}"; do
+                if [[ "$INPUT_FILE" == *"_${CHUNK_NUM}.csv" ]]; then
+                    PRESENT_INPUT_FILES+=("$INPUT_FILE")
+                    break
+                fi
+            done
+        done
 
-        empty_count = check_chunk_empties(output_file, INPUT_COLS)
-        if empty_count > 0:
-            empty_chunks.append((chunk_num, empty_count))
+        # wc -l on all input files at once, parse results
+        while IFS= read -r LINE; do
+            COUNT=$(echo "$LINE" | awk '{print $1}')
+            FILE=$(echo "$LINE" | awk '{print $2}')
+            [ "$FILE" = "total" ] && continue
+            CHUNK=$(basename "$FILE" .csv | grep -oP '\d+$')
+            IN_COUNTS[$CHUNK]=$COUNT
+        done < <(wc -l "${PRESENT_INPUT_FILES[@]}" 2>/dev/null)
 
-    total      = len(input_chunks)
-    n_missing  = len(missing_chunks)
-    n_empty    = sum(c for _, c in empty_chunks)
-    status     = f"{done}/{total}"
+        # wc -l on all output files at once
+        while IFS= read -r LINE; do
+            COUNT=$(echo "$LINE" | awk '{print $1}')
+            FILE=$(echo "$LINE" | awk '{print $2}')
+            [ "$FILE" = "total" ] && continue
+            CHUNK=$(basename "$FILE" .csv | grep -oP '\d+$')
+            OUT_COUNTS[$CHUNK]=$COUNT
+        done < <(wc -l "${PRESENT_OUTPUT_FILES[@]}" 2>/dev/null)
 
-    print(f"{library:<45} {total:>7,} {n_missing:>8,} {n_empty:>11,} {status:>7}")
+        for CHUNK_NUM in "${PRESENT_CHUNK_NUMS[@]}"; do
+            IN_ROWS=$(( ${IN_COUNTS[$CHUNK_NUM]:-1} - 1 ))
+            OUT_ROWS=$(( ${OUT_COUNTS[$CHUNK_NUM]:-0} - 1 ))
+            if [ "$IN_ROWS" -ne "$OUT_ROWS" ]; then
+                MISMATCH_CHUNKS+=("$CHUNK_NUM")
+            else
+                DONE=$(( DONE + 1 ))
+            fi
+        done
+    fi
 
-    if missing_chunks:
-        chunks_str = ", ".join(missing_chunks[:20])
-        suffix = f" ... (+{len(missing_chunks)-20} more)" if len(missing_chunks) > 20 else ""
-        print(f"  MISSING chunks : {chunks_str}{suffix}")
+    # ── Empty row detection via awk (one pass per library across all output files) ─
+    # Reads header from first file to find result column indices, then counts
+    # rows where ALL result columns are empty across all output files.
+    TOTAL_EMPTY=0
+    EMPTY_CHUNK_SUMMARY=""
 
-    if mismatch_chunks:
-        chunks_str = ", ".join(mismatch_chunks[:20])
-        suffix = f" ... (+{len(mismatch_chunks)-20} more)" if len(mismatch_chunks) > 20 else ""
-        print(f"  MISMATCH chunks: {chunks_str}{suffix}")
+    if [ ${#PRESENT_OUTPUT_FILES[@]} -gt 0 ]; then
+        # Build space-separated list of input col names for awk
+        AWK_SKIP_COLS="$INPUT_COLS"
 
-    if empty_chunks:
-        top = empty_chunks[:10]
-        summary = ", ".join(f"{c}({n} rows)" for c, n in top)
-        suffix = f" ... (+{len(empty_chunks)-10} more chunks)" if len(empty_chunks) > 10 else ""
-        print(f"  EMPTY row chunks: {summary}{suffix}")
+        EMPTY_RESULTS=$(awk -F',' \
+            -v skip_cols="$AWK_SKIP_COLS" \
+            '
+            FNR == 1 {
+                # Reset result column indices for each file
+                delete result_idx
+                n_result = 0
+                split(skip_cols, skip_arr)
+                for (i = 1; i <= NF; i++) {
+                    col = tolower($i)
+                    gsub(/^[ \t\r]+|[ \t\r]+$/, "", col)
+                    is_skip = 0
+                    for (j in skip_arr) {
+                        if (skip_arr[j] == col) { is_skip = 1; break }
+                    }
+                    if (!is_skip) { result_idx[++n_result] = i }
+                }
+                # Extract chunk number from filename
+                fname = FILENAME
+                sub(/.*_results_/, "", fname)
+                sub(/\.csv$/, "", fname)
+                current_chunk = fname
+                chunk_empty[current_chunk] = 0
+                next
+            }
+            {
+                if (n_result == 0) next
+                all_empty = 1
+                for (k = 1; k <= n_result; k++) {
+                    val = $(result_idx[k])
+                    gsub(/^[ \t\r]+|[ \t\r]+$/, "", val)
+                    if (val != "") { all_empty = 0; break }
+                }
+                if (all_empty) chunk_empty[current_chunk]++
+            }
+            END {
+                for (chunk in chunk_empty) {
+                    if (chunk_empty[chunk] > 0)
+                        print chunk, chunk_empty[chunk]
+                }
+            }
+            ' "${PRESENT_OUTPUT_FILES[@]}" 2>/dev/null | sort)
 
-print("=" * 75)
-print()
-EOF
+        while IFS= read -r LINE; do
+            [ -z "$LINE" ] && continue
+            CHUNK=$(echo "$LINE" | awk '{print $1}')
+            COUNT=$(echo "$LINE" | awk '{print $2}')
+            TOTAL_EMPTY=$(( TOTAL_EMPTY + COUNT ))
+            EMPTY_CHUNK_SUMMARY="${EMPTY_CHUNK_SUMMARY} ${CHUNK}(${COUNT})"
+        done <<< "$EMPTY_RESULTS"
+    fi
+
+    printf "%-45s %7d %8d %11d %7s\n" \
+        "$LIBRARY" "$TOTAL" "${#MISSING_CHUNKS[@]}" "$TOTAL_EMPTY" "${DONE}/${TOTAL}"
+
+    if [ ${#MISSING_CHUNKS[@]} -gt 0 ]; then
+        SHOWN=("${MISSING_CHUNKS[@]:0:20}")
+        MSG=$(IFS=", "; echo "${SHOWN[*]}")
+        [ ${#MISSING_CHUNKS[@]} -gt 20 ] && MSG="${MSG} ... (+$(( ${#MISSING_CHUNKS[@]} - 20 )) more)"
+        echo "  MISSING chunks : $MSG"
+    fi
+
+    if [ ${#MISMATCH_CHUNKS[@]} -gt 0 ]; then
+        SHOWN=("${MISMATCH_CHUNKS[@]:0:20}")
+        MSG=$(IFS=", "; echo "${SHOWN[*]}")
+        [ ${#MISMATCH_CHUNKS[@]} -gt 20 ] && MSG="${MSG} ... (+$(( ${#MISMATCH_CHUNKS[@]} - 20 )) more)"
+        echo "  MISMATCH chunks: $MSG"
+    fi
+
+    if [ -n "$EMPTY_CHUNK_SUMMARY" ]; then
+        echo "  EMPTY row chunks:$(echo "$EMPTY_CHUNK_SUMMARY" | tr ' ' '\n' | grep -v '^$' | head -10 | tr '\n' ' ')"
+    fi
+
+    unset IN_COUNTS OUT_COUNTS
+done
+
+printf "=%.0s" {1..75}; echo ""
+echo ""

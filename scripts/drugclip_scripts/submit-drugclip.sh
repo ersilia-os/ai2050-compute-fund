@@ -2,16 +2,16 @@
 # Submit DrugCLIP embedding jobs for one chemical library.
 #
 # Usage:
-#   bash /shared/scripts/drugclip/submit-drugclip.sh <library_name> [queue]
+#   bash /shared/scripts/drugclip_scripts/submit-drugclip.sh <library_name> [queue]
 #
 # Examples:
-#   bash /shared/scripts/drugclip/submit-drugclip.sh Enamine_Hit_Locator_460K
-#   bash /shared/scripts/drugclip/submit-drugclip.sh Enamine_Hit_Locator_460K gpu-queue
-#   bash /shared/scripts/drugclip/submit-drugclip.sh Enamine_Real_Sample_10.4M
-#   bash /shared/scripts/drugclip/submit-drugclip.sh Enamine_Hit_Locator_460K cpu-queue
+#   bash /shared/scripts/drugclip_scripts/submit-drugclip.sh Enamine_Hit_Locator_460K
+#   bash /shared/scripts/drugclip_scripts/submit-drugclip.sh Enamine_Hit_Locator_460K gpu-queue
+#   bash /shared/scripts/drugclip_scripts/submit-drugclip.sh Enamine_Real_Sample_10.4M
+#   bash /shared/scripts/drugclip_scripts/submit-drugclip.sh Enamine_Hit_Locator_460K cpu-queue
 #
 # Input:  /fsx/input/<library>/<library>_chunk_NNN.csv
-# Output: /fsx/output/<library>/drugclip/<library>_drugclip_NNN.h5
+# Output: /fsx/output/<library>/drugclip/<library>_drugclip_NNN.csv (+ .h5, .smiles.txt)
 
 LIBRARY_NAME=$1
 QUEUE=${2:-gpu-queue}
@@ -42,9 +42,9 @@ if [ ! -f "/shared/sif-files/drugclip.sif" ]; then
     exit 1
 fi
 
-if [ ! -f "/shared/drugclip-weights/checkpoint_best.pt" ]; then
-    echo "ERROR: Weights not found at /shared/drugclip-weights/checkpoint_best.pt"
-    echo "  Download: aws s3 cp s3://ai2050-ersilia-cluster/drugclip-weights/checkpoint_best.pt /shared/drugclip-weights/"
+if [ ! -f "/shared/drugclip-weights/6_folds/fold_0.pt" ]; then
+    echo "ERROR: Weights not found at /shared/drugclip-weights/6_folds/fold_0.pt"
+    echo "  Download: aws s3 sync s3://ai2050-ersilia-cluster/drugclip-weights/model_weights/6_folds/ /shared/drugclip-weights/6_folds/"
     exit 1
 fi
 

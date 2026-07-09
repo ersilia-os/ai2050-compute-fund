@@ -44,7 +44,7 @@ Scheduling:
         - Name: test-t3-medium
           InstanceType: t3.medium
           MinCount: 0
-          MaxCount: 5
+          MaxCount: 2
       ComputeSettings:
         LocalStorage:
           RootVolume:
@@ -79,7 +79,7 @@ Scheduling:
             - InstanceType: c5a.8xlarge   # AMD,   32 vCPU, 64GB
             - InstanceType: m6i.8xlarge   # Intel, 32 vCPU, 128GB (fallback)
           MinCount: 0
-          MaxCount: 20
+          MaxCount: 25
       ComputeSettings:
         LocalStorage:
           RootVolume:
@@ -96,8 +96,7 @@ Scheduling:
     # GPU QUEUE - GPU workloads
     # ========================================
     - Name: gpu-queue
-      CapacityType: SPOT
-      AllocationStrategy: capacity-optimized
+      CapacityType: ONDEMAND
       Networking:
         SubnetIds:
           - subnet-0157f3ce5e347347c
@@ -107,14 +106,17 @@ Scheduling:
         PlacementGroup:
           Enabled: false
       ComputeResources:
-        # g6.4xlarge: 1x L4 GPU (24GB), 16 vCPU — primary
-        # g4dn.4xlarge: 1x T4 GPU (16GB), 16 vCPU — fallback
+        # All instances: single GPU, 16 vCPU, available in eu-north-1a (On-Demand).
+        # g6e.4xlarge: 1x L40S GPU (48GB) — best GPU in zone
+        # g6.4xlarge:  1x L4 GPU (24GB)
+        # g4dn.4xlarge: 1x T4 GPU (16GB) — widest availability
         - Name: gpu-g6-4xl
           Instances:
+            - InstanceType: g6e.4xlarge
             - InstanceType: g6.4xlarge
             - InstanceType: g4dn.4xlarge
           MinCount: 0
-          MaxCount: 10
+          MaxCount: 8
       ComputeSettings:
         LocalStorage:
           RootVolume:

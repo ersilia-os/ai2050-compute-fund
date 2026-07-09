@@ -1,17 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=ersilia-bisect
+#SBATCH --job-name=singularity-bisect
+#SBATCH --partition=cpu-queue
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=2
-#SBATCH --time=2-00:00:00
+#SBATCH --exclusive
+#SBATCH --time=24:00:00
 #SBATCH --output=/shared/logs/bisect-%A_%a.out
 #SBATCH --error=/shared/logs/bisect-%A_%a.err
 
-# Run one sub-chunk of a binary search on a failed Ersilia chunk.
+# Run one sub-chunk of a divide-and-conquer search on a failed singularity batch chunk.
 #
-# Submitted by bisect-ersilia-chunk.sh (initial split) or recursively by
+# Submitted by bisect-singularity-chunk.sh (initial split) or recursively by
 # this script itself (subsequent splits). Never call this script directly.
 #
-# Args: MODEL_ID BISECT_DIR LIBRARY_NAME CHUNK_NUM TASKS_FILE [QUEUE]
+# Args: MODEL_ID CHUNK_NUM BISECT_DIR TASKS_FILE [QUEUE]
 #
 # TASKS_FILE has one "START END" pair per line; SLURM_ARRAY_TASK_ID selects
 # the line. START/END are 0-based row indices in the original chunk (excl. header).
@@ -19,15 +20,13 @@
 set -uo pipefail
 
 MODEL_ID=$1
-BISECT_DIR=$2
-LIBRARY_NAME=$3
-CHUNK_NUM=$4
-TASKS_FILE=$5
-QUEUE=${6:-cpu-queue}
+CHUNK_NUM=$2
+BISECT_DIR=$3
+TASKS_FILE=$4
+QUEUE=${5:-cpu-queue}
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
 
-# Read START and END for this task
 TASK_LINE=$(sed -n "$((TASK_ID+1))p" "$TASKS_FILE")
 START=$(echo "$TASK_LINE" | awk '{print $1}')
 END=$(echo "$TASK_LINE" | awk '{print $2}')
@@ -38,18 +37,18 @@ SIF_FILE="/shared/sif-files/${MODEL_ID}.sif"
 NUM_MOLS=$(( END - START + 1 ))
 
 echo "=========================================="
-echo "Ersilia Bisect Job"
+echo "Singularity Bisect Job"
 echo "=========================================="
 echo "Job ID:  ${SLURM_JOB_ID:-local}  Task: ${TASK_ID}"
 echo "Node:    $(hostname)"
 echo "Date:    $(date)"
 echo "Model:   $MODEL_ID"
+echo "Chunk:   $CHUNK_NUM"
 echo "Range:   [${START}..${END}] (${NUM_MOLS} molecules)"
 echo "Input:   $SUB_CHUNK"
 echo "Output:  $SUB_RESULT"
 echo "=========================================="
 
-# Validate
 if [ ! -f "$SIF_FILE" ]; then
     echo "ERROR: SIF file not found: $SIF_FILE"
     exit 1
@@ -60,17 +59,14 @@ if [ ! -f "$SUB_CHUNK" ]; then
     exit 1
 fi
 
-echo "Running ersilia-apptainer on ${NUM_MOLS} molecules..."
+echo "Running singularity on ${NUM_MOLS} molecules..."
 
-/shared/python39/bin/ersilia_apptainer \
-    --sif "$SIF_FILE" \
-    --input "$SUB_CHUNK" \
-    --output "$SUB_RESULT" --verbose
+singularity run --bind /fsx:/fsx --bind /shared:/shared "$SIF_FILE" "$SUB_CHUNK" "$SUB_RESULT"
 
-ERSILIA_EXIT=$?
+SINGULARITY_EXIT=$?
 
 # ── Success ────────────────────────────────────────────────────────────────────
-if [ $ERSILIA_EXIT -eq 0 ] && [ -f "$SUB_RESULT" ]; then
+if [ $SINGULARITY_EXIT -eq 0 ] && [ -f "$SUB_RESULT" ]; then
     echo "✓ Success: result_${START}_${END}.csv ($(wc -l < "$SUB_RESULT") lines)"
     exit 0
 fi
@@ -85,26 +81,22 @@ if [ $NUM_MOLS -eq 1 ]; then
 import csv, hashlib, glob, os
 
 bisect_dir = "$BISECT_DIR"
-library_name = "$LIBRARY_NAME"
-model_id = "$MODEL_ID"
-sub_chunk = "$SUB_CHUNK"
+model_id   = "$MODEL_ID"
+sub_chunk  = "$SUB_CHUNK"
 sub_result = "$SUB_RESULT"
 
-# Read the SMILES from the sub-chunk
 with open(sub_chunk, newline="") as f:
     reader = csv.reader(f)
-    next(reader)  # skip header
+    next(reader)
     row = next(reader)
     smiles = row[0]
 
 key = hashlib.md5(smiles.encode("utf-8")).hexdigest()
 
-# Find property column names from any completed result in this bisect dir,
-# falling back to the main output directory for this model
 prop_cols = []
 candidates = (
     glob.glob(os.path.join(bisect_dir, "result_*.csv")) +
-    glob.glob(f"/fsx/output/{library_name}/{model_id}/{model_id}_results_*.csv")
+    glob.glob(f"/fsx/output/batch_outputs/{model_id}_*.csv")
 )
 for path in candidates:
     try:
@@ -135,7 +127,7 @@ bisect_dir = "$BISECT_DIR"
 sub_chunk  = "$SUB_CHUNK"
 start      = $START
 end        = $END
-n_splits   = min(10, end - start + 1)   # never more pieces than molecules
+n_splits   = min(10, end - start + 1)
 
 with open(sub_chunk, newline="") as f:
     reader = csv.reader(f)
@@ -178,11 +170,10 @@ PYEOF
         --job-name="bisect_${MODEL_ID}_${CHUNK_NUM}_${START}_${END}" \
         --output="/shared/logs/bisect-%A_%a.out" \
         --error="/shared/logs/bisect-%A_%a.err" \
-        /shared/scripts/run-ersilia-bisect.sh \
+        /shared/scripts/singularity/run-singularity-bisect.sh \
         "$MODEL_ID" \
-        "$BISECT_DIR" \
-        "$LIBRARY_NAME" \
         "$CHUNK_NUM" \
+        "$BISECT_DIR" \
         "$NEW_TASKS" \
         "$QUEUE")
 

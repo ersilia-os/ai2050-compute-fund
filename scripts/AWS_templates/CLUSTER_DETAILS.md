@@ -50,7 +50,7 @@ s3://ai2050-ersilia-cluster/
 |-------|---------------|-------|-----|-----------|----------------|----------|
 | **test-queue** | t3.medium | 2 | 4GB | 5 | ~$0.012 | Testing small chunks |
 | **cpu-queue** | c6i.8xlarge, c7i.8xlarge, c5a.8xlarge, m6i.8xlarge | 32 | 64-128GB | 20 | ~$0.26 | Production processing |
-| **gpu-queue** | g5.4xlarge | 16 | 64GB | 10 | ~$0.43 | GPU models |
+| **gpu-queue** | g6.4xlarge, g4dn.4xlarge | 16 | 64GB | 10 | ~$0.43 | GPU models |
 
 > **cpu-queue uses multiple instance types** with `capacity-optimized` allocation strategy. AWS automatically picks whichever has available Spot capacity, avoiding `InsufficientInstanceCapacity` errors.
 
