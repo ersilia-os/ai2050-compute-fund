@@ -1,0 +1,19 @@
+# Wave scheduler queue — one job per line. Copy this file and edit.
+#
+# Format:  <model_id>  <mode>  [library]  [wave_size]  [queue]
+#   model_id  : the model to run (its SIF must be at /shared/sif-files/<model_id>.sif)
+#   mode      : ersilia | singularity
+#   library   : full name or alias (real, molport, coconut, hit, liquid);
+#               optional -> falls back to the driver's default_library arg
+#   wave_size : 1..1000  (optional -> default 1000)
+#   queue     : SLURM partition (optional -> default cpu-queue)
+#
+# Blank lines and lines starting with '#' (even indented) are ignored.
+# Jobs run top-to-bottom, one at a time; the next starts when the previous finishes.
+
+# --- examples (edit / delete) ---
+eos4k4f_v1          ersilia      Enamine_Real_Sample_1.4B
+eos2r5a             ersilia      Coconut_715K
+mtb-public-models   singularity  molport                    500
+# uses the driver's default_library (pass it as arg 2 to run-model-queue.sh):
+# eos3b5e           ersilia

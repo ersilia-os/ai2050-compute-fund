@@ -1,0 +1,100 @@
+Region: eu-north-1
+Image:
+  Os: alinux2023   # new GPU-only cluster runs on AL2023 (the existing CPU cluster stays on AL2, untouched)
+
+# ============================================================================
+# GPU-ONLY CLUSTER (ai2050-cluster-gpu)
+# ----------------------------------------------------------------------------
+# Purpose: run GPU workloads on a SEPARATE head node / Slurm controller so they
+# no longer compete with the CPU cluster for a single head node's capacity
+# (that coupling was causing the "head node can't spin up that many instances"
+# build failure when CPU + GPU MaxCounts were both large in one cluster).
+#
+# The existing CPU cluster (Amazon Linux 2) is left completely untouched and
+# keeps owning the shared EFS/FSx below. This cluster just MOUNTS them by ID.
+# ============================================================================
+
+HeadNode:
+  InstanceType: t3.xlarge   # 4 vCPU / 16 GB — ample for a GPU-only scheduler
+  Networking:
+    SubnetId: subnet-006a7368f76fbc413      # SAME public subnet as the CPU cluster
+    SecurityGroups:
+      - sg-08c20fe73a22a1290
+  Ssh:
+    KeyName: ersilia-key
+  LocalStorage:
+    RootVolume:
+      Size: 50
+      VolumeType: gp3
+  Iam:
+    AdditionalIamPolicies:
+      - Policy: arn:aws:iam::aws:policy/AmazonS3FullAccess
+      - Policy: arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  CustomActions:
+    OnNodeConfigured:
+      # Minimal bootstrap: only wires up PATH/env against the ALREADY-populated
+      # shared EFS. Does NOT recreate /shared/scripts (avoids clobbering the CPU cluster).
+      # Upload bootstrap-head-al2023.sh to this S3 path before deploying.
+      Script: s3://ai2050-ersilia-cluster/scripts/bootstrap-head-al2023.sh
+
+Scheduling:
+  Scheduler: slurm
+  SlurmSettings:
+    ScaledownIdletime: 5
+  SlurmQueues:
+    # ========================================
+    # GPU QUEUE - the only queue on this cluster
+    # ========================================
+    - Name: gpu-queue
+      CapacityType: ONDEMAND
+      Networking:
+        SubnetIds:
+          - subnet-0157f3ce5e347347c      # SAME private subnet as the CPU cluster
+        SecurityGroups:
+          - sg-01fecc8fbceb6701b          # SAME compute SG — already allows EFS/FSx mounts
+        AssignPublicIp: false
+        PlacementGroup:
+          Enabled: false
+      ComputeResources:
+        - Name: gpu-g6-4xl
+          Instances:
+            - InstanceType: g6e.4xlarge   # 1x L40S (48GB), 16 vCPU
+            - InstanceType: g6.4xlarge    # 1x L4 (24GB), 16 vCPU
+            - InstanceType: g4dn.4xlarge  # 1x T4 (16GB), 16 vCPU
+          MinCount: 0
+          MaxCount: 16   # bumped from 8 — set to your target; needs On-Demand G quota (L-DB2E81BA), 16 x 16 vCPU = 256
+      ComputeSettings:
+        LocalStorage:
+          RootVolume:
+            Size: 200
+            VolumeType: gp3
+      Iam:
+        AdditionalIamPolicies:
+          - Policy: arn:aws:iam::aws:policy/AmazonS3FullAccess
+      CustomActions:
+        OnNodeConfigured:
+          Script: s3://ai2050-ersilia-cluster/scripts/bootstrap-compute.sh
+
+SharedStorage:
+  # EFS - ATTACH the EXISTING one (owned by the CPU cluster) by ID — no reinstall.
+  # Reference-by-ID takes ONLY FileSystemId (no PerformanceMode/ThroughputMode/Encrypted).
+  - MountDir: /shared
+    Name: shared-efs
+    StorageType: Efs
+    EfsSettings:
+      FileSystemId: fs-0ac858f5db4a1fc9e
+
+  # FSx Lustre - ATTACH the EXISTING one by ID (shared; CPU cluster stays alive as owner).
+  - MountDir: /fsx
+    Name: fsx-models
+    StorageType: FsxLustre
+    FsxLustreSettings:
+      FileSystemId: fs-05264985cd6fc96e3
+
+Tags:
+  - Key: Project
+    Value: AI2050        # same tag → costs auto-merge with the CPU cluster in Cost Explorer
+  - Key: CostCenter
+    Value: Research
+  - Key: Environment
+    Value: Development
