@@ -25,23 +25,35 @@ TARGETS_DIR=${1:-}
 STAGING_DIR=${2:-}
 DRY_RUN=0
 UPLOAD=1
+DEST_PREFIX=targets          # S3/FSx top-level folder: input/<DEST_PREFIX>/<ID>/pockets/
+ONLY=                        # optional comma-separated UniProt filter
+PROBE_RADIUS=0               # 0 = single center atom; >0 = pocket-filling dummy ball
 S3_BUCKET=${S3_BUCKET:-ai2050-ersilia-cluster}
 
-for arg in "${@:3}"; do
-    case "$arg" in
-        --dry-run)   DRY_RUN=1 ;;
-        --no-upload) UPLOAD=0 ;;
-        *) echo "Unknown option: $arg"; exit 1 ;;
+shift $(( $# >= 2 ? 2 : $# ))
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run)      DRY_RUN=1 ;;
+        --no-upload)    UPLOAD=0 ;;
+        --dest-prefix)  DEST_PREFIX=$2; shift ;;
+        --only)         ONLY=$2; shift ;;
+        --probe-radius) PROBE_RADIUS=$2; shift ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
     esac
+    shift
 done
 
 if [ -z "$TARGETS_DIR" ] || [ -z "$STAGING_DIR" ]; then
     echo "Usage: $0 <targets_dir> <staging_dir> [--dry-run] [--no-upload]"
+    echo "        [--dest-prefix targets] [--only ID1,ID2,...] [--probe-radius R]"
     echo ""
-    echo "  targets_dir  - folder of UniProt target subfolders (P00519/, Q9UM73/, ...)"
-    echo "  staging_dir  - local dir to build targets/<ID>/pockets/ before upload"
-    echo "  --dry-run    - report per-target counts only; write nothing, upload nothing"
-    echo "  --no-upload  - prepare files locally but skip the S3 sync"
+    echo "  targets_dir     - folder of UniProt target subfolders (P00519/, Q9UM73/, ...)"
+    echo "  staging_dir     - local dir to build <dest-prefix>/<ID>/pockets/ before upload"
+    echo "  --dry-run       - report per-target counts only; write nothing, upload nothing"
+    echo "  --no-upload     - prepare files locally but skip the S3 sync"
+    echo "  --dest-prefix   - S3/FSx top folder (default targets; use e.g. targets_probe)"
+    echo "  --only          - restrict to these UniProt IDs (comma-separated)"
+    echo "  --probe-radius  - dummy-atom ball radius (A); 0 = single center atom (default)"
     exit 1
 fi
 
@@ -59,7 +71,9 @@ echo "Stage DrugCLIP pockets"
 echo "=========================================="
 echo "Targets dir : $TARGETS_DIR"
 echo "Staging dir : $STAGING_DIR"
-echo "S3 dest     : ${S3_DEST}targets/<ID>/pockets/"
+echo "S3 dest     : ${S3_DEST}${DEST_PREFIX}/<ID>/pockets/"
+echo "Probe radius: $PROBE_RADIUS" $([ "$PROBE_RADIUS" != 0 ] && echo "(pocket-filling ball)")
+echo "Only        : ${ONLY:-<all>}"
 echo "Dry run     : $DRY_RUN"
 echo "Upload      : $UPLOAD"
 echo "=========================================="
@@ -72,11 +86,15 @@ for d in "$TARGETS_DIR"/*/; do
     if ! ls "$d"/*_center.txt >/dev/null 2>&1; then
         continue
     fi
-    OUT_DIR="${STAGING_DIR}/targets/${TARGET}/pockets"
+    # Optional UniProt filter
+    if [ -n "$ONLY" ] && ! echo ",$ONLY," | grep -q ",$TARGET,"; then
+        continue
+    fi
+    OUT_DIR="${STAGING_DIR}/${DEST_PREFIX}/${TARGET}/pockets"
     if [ "$DRY_RUN" -eq 1 ]; then
-        python3 "$ADAPTER" --target-dir "$d" --out-dir "$OUT_DIR" --dry-run
+        python3 "$ADAPTER" --target-dir "$d" --out-dir "$OUT_DIR" --probe-radius "$PROBE_RADIUS" --dry-run
     else
-        python3 "$ADAPTER" --target-dir "$d" --out-dir "$OUT_DIR"
+        python3 "$ADAPTER" --target-dir "$d" --out-dir "$OUT_DIR" --probe-radius "$PROBE_RADIUS"
     fi
     N_TARGETS=$(( N_TARGETS + 1 ))
 done

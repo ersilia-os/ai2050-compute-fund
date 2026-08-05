@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scheduler-tui"
+version = "0.1.0"
+description = "Terminal dashboard for the Ersilia wave scheduler — watch and steer a running model queue on the AWS cluster"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Ersilia Open Source Initiative", email = "hello@ersilia.io" }]
+keywords = ["ersilia", "slurm", "hpc", "tui", "textual", "scheduler"]
+
+dependencies = [
+    "textual>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "textual-dev>=1.6"]
+
+[project.scripts]
+scheduler-tui = "scheduler_tui.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/ersilia-os/ersilia"
+
+[tool.setuptools]
+packages = ["scheduler_tui"]
+
+[tool.setuptools.package-data]
+scheduler_tui = ["*.tcss"]

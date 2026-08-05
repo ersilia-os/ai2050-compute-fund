@@ -15,7 +15,7 @@ Image:
 # ============================================================================
 
 HeadNode:
-  InstanceType: t3.xlarge   # 4 vCPU / 16 GB — ample for a GPU-only scheduler
+  InstanceType: t3.2xlarge   # 8 vCPU / 32 GB — ample for a GPU-only scheduler
   Networking:
     SubnetId: subnet-006a7368f76fbc413      # SAME public subnet as the CPU cluster
     SecurityGroups:
@@ -43,7 +43,12 @@ Scheduling:
     ScaledownIdletime: 5
   SlurmQueues:
     # ========================================
-    # GPU QUEUE - the only queue on this cluster
+    # GPU QUEUE - the GPU workhorse of this cluster.
+    # NOTE: intentionally shares the name 'gpu-queue' with the AL2 cluster's
+    # partition. The two clusters are separate Slurm controllers, so `sbatch -p
+    # gpu-queue` acts on whichever head node you are SSH'd into — you are
+    # responsible for confirming the cluster (e.g. `scontrol show config |
+    # grep ClusterName`) before submitting.
     # ========================================
     - Name: gpu-queue
       CapacityType: ONDEMAND
@@ -62,7 +67,12 @@ Scheduling:
             - InstanceType: g6.4xlarge    # 1x L4 (24GB), 16 vCPU
             - InstanceType: g4dn.4xlarge  # 1x T4 (16GB), 16 vCPU
           MinCount: 0
-          MaxCount: 16   # bumped from 8 — set to your target; needs On-Demand G quota (L-DB2E81BA), 16 x 16 vCPU = 256
+          # 16 x 16 vCPU = 256 vCPU against On-Demand G quota (L-DB2E81BA).
+          # That quota is 64 in eu-north-1 today, so until an increase to >=256
+          # is approved this plateaus at 4 nodes and jobs for nodes 5+ requeue
+          # in a loop. Request: aws service-quotas request-service-quota-increase
+          #   --service-code ec2 --quota-code L-DB2E81BA --desired-value 256 --region eu-north-1
+          MaxCount: 16
       ComputeSettings:
         LocalStorage:
           RootVolume:
@@ -73,7 +83,45 @@ Scheduling:
           - Policy: arn:aws:iam::aws:policy/AmazonS3FullAccess
       CustomActions:
         OnNodeConfigured:
-          Script: s3://ai2050-ersilia-cluster/scripts/bootstrap-compute.sh
+          Script: s3://ai2050-ersilia-cluster/scripts/bootstrap-compute-al2023.sh
+
+    # ========================================
+    # CPU QUEUE - CPU pre/post-processing for GPU pipelines on this cluster,
+    # so a prep -> embed -> merge chain can keep --dependency=afterok on one
+    # Slurm controller (dependencies do not resolve across clusters).
+    # Shares the name 'cpu-queue' with the AL2 cluster (same caveat as above).
+    # 4 x 32 vCPU = 128 Spot vCPU on the shared L-34B43A08 pool.
+    # ----------------------------------------------------------------------
+    - Name: cpu-queue
+      CapacityType: SPOT
+      AllocationStrategy: capacity-optimized
+      Networking:
+        SubnetIds:
+          - subnet-0157f3ce5e347347c      # SAME private subnet as the GPU queue
+        SecurityGroups:
+          - sg-01fecc8fbceb6701b          # SAME compute SG — EFS/FSx mounts already allowed
+        AssignPublicIp: false
+      ComputeResources:
+        # Several types for Spot resilience (32 vCPU class)
+        - Name: cpu-c6i-8xl
+          Instances:
+            - InstanceType: c6i.8xlarge   # Intel, 32 vCPU, 64GB
+            - InstanceType: c7i.8xlarge   # Intel, 32 vCPU, 64GB (newer)
+            - InstanceType: c5a.8xlarge   # AMD,   32 vCPU, 64GB
+            - InstanceType: m6i.8xlarge   # Intel, 32 vCPU, 128GB (fallback)
+          MinCount: 0
+          MaxCount: 4
+      ComputeSettings:
+        LocalStorage:
+          RootVolume:
+            Size: 100
+            VolumeType: gp3
+      Iam:
+        AdditionalIamPolicies:
+          - Policy: arn:aws:iam::aws:policy/AmazonS3FullAccess
+      CustomActions:
+        OnNodeConfigured:
+          Script: s3://ai2050-ersilia-cluster/scripts/bootstrap-compute-al2023.sh
 
 SharedStorage:
   # EFS - ATTACH the EXISTING one (owned by the CPU cluster) by ID — no reinstall.

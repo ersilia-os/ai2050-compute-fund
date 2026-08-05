@@ -12,6 +12,7 @@ untouched and still handle the five smaller libraries.
 | 1.5 | `submit-ersilia-waves.sh` + `run-ersilia-wave-job.sh` | Run the standardization model over all ~14,100 chunks in FSx-bounded waves; results → S3 |
 | 2a | `submit-tag-ids.sh` + `run-tag-ids-job.sh` + `join_ids.py` | **On cluster**: re-attach the collection id to each standardized SMILES → gzip *tagged* shards in S3 |
 | 2b | `dedup_and_map.py` | **Local**: dedup standardized SMILES (keep first) → **final `standardized_smiles→id` map** + deduped input chunks |
+| 01b | `prepare-h3d-selected-library.sh` | Ingest a *selected* subset (`key,input` gzip) as its own library — step 01 only, no restandardization |
 
 The end-to-end path is **01 → 1.5 (standardize) → 2a (tag) → 2b (dedup + map)**, then
 run downstream models on the deduplicated set. Standardization runs via the **wave
@@ -182,6 +183,38 @@ first appearance** (hash-sharded → memory-bounded at 1.4B), and writes:
 Tune with `--buckets` (RAM vs open files) and `--chunk-size`; `--no-download` if the
 tagged shards are already local. Downstream models then run via the wave orchestrator on
 library `Enamine_Real_Sample_1.4B_std`.
+
+## Step 01b — ingest a *selected* subset as a new library
+
+`prepare-h3d-selected-library.sh` turns a single gzip file of already-selected,
+already-standardized molecules into a normal input library. It is **step 01 only** —
+the molecules came out of the standardized+deduped 1.4B set, so steps 1.5 / 2a / 2b are
+**not** rerun; the id map is written directly, row-aligned per chunk.
+
+Input schema: two columns, `key` (32-char hex molecule key → stored as `collection_id`)
+and `input` (standardized SMILES → the chunk `smiles`). Delimiter is auto-detected from
+the header; the run aborts early if the header can't be read.
+
+```bash
+# smoke test first (throwaway output dir, no upload, works on a partial download)
+LIMIT=200000 ./prepare-h3d-selected-library.sh ~/h3d_selected_100M.csv.gz ./smoke
+
+# full run — 100M @ 50k/chunk = ~2,000 chunks, uploads chunks + id shards to S3
+./prepare-h3d-selected-library.sh ~/h3d_selected_100M.csv.gz ./output
+```
+
+Defaults: `LIB=Enamine_Real_h3d_selected`, `CHUNK_SIZE=50000`. Override any of
+`LIB CHUNK_SIZE S3_BUCKET SMILES_COL ID_COL DELIM LIMIT NO_UPLOAD` via env.
+A full run first does `gzip -t` (guards against ingesting a still-downloading file);
+skip with `SKIP_INTEGRITY_CHECK=1`. Re-running the same command **resumes**.
+
+**Wave sizing differs here**: chunks are 50k rows, half the 100k used for the 1.4B
+library, so a given wave holds half the output — the sizing formula in step 1.5 can be
+read with `0.05M` instead of `0.1M` rows/chunk.
+
+To map results back to the original Enamine catalogue ids, join this library's
+`collection_id` (the hex key) against the 1.4B final map
+(`Enamine_Real_Sample_1.4B_smiles_ids_dedup.csv.gz`) on the standardized SMILES.
 
 ## Notes / assumptions
 

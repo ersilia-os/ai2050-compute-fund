@@ -1,12 +1,20 @@
 #!/bin/bash
 # =============================================================================
-# Wave scheduler — sequential multi-model driver.
+# Wave scheduler — sequential multi-model driver (dynamic queue).
 # =============================================================================
 # Reads a queue of models and runs each one's wave orchestrator back-to-back so
 # the cluster stays busy with minimal idle time. For each queue line it dispatches
-# submit-ersilia-waves.sh or submit-singularity-waves.sh (both BLOCK until the
-# model's whole library is processed), captures the exit code, and maintains an
-# atomic status file that scheduler-status.sh renders.
+# submit-ersilia-waves.sh or submit-singularity-waves.sh, captures the exit code,
+# and maintains an atomic status file that scheduler-status.sh renders.
+#
+# The queue file is the LIVE SOURCE OF TRUTH: it is re-read before every job, so
+# you can add / remove / reorder / hold models while the driver runs. Line order
+# IS the priority. Use sched-ctl.sh (or the Textual TUI) to edit it safely, or
+# hand-edit it — both take the same lock.
+#
+# The dispatched orchestrator runs in its OWN PROCESS GROUP in the background and
+# is polled, so the driver stays responsive to control requests (pause, cancel the
+# running model) instead of blocking for hours inside the child.
 #
 # Runs on the HEAD NODE inside tmux (a full queue can take days):
 #   tmux new -s scheduler
@@ -14,14 +22,16 @@
 # ...or launch it detached with start-scheduler-tmux.sh.
 #
 # Usage:
-#   run-model-queue.sh <queue_file> [default_library] [default_wave_size] [default_queue] [--dry-run]
+#   run-model-queue.sh <queue_file> [default_library] [default_wave_size] [default_queue]
+#                      [--dry-run] [--exit-when-empty]
 #
 # Queue file: one job per line; blank lines and '#' comments (incl. indented) ignored;
 # whitespace-separated:
-#   <model_id> <mode> [library] [wave_size] [queue]      mode = ersilia | singularity
+#   <model_id> <mode> [library] [wave_size] [queue] [flags]   mode = ersilia | singularity
 #   * library optional  -> default_library (alias-resolved; e.g. real -> Enamine_Real_Sample_10.4M)
 #   * wave_size optional -> default_wave_size (1..1000)
 #   * queue optional     -> default_queue
+#   * flags optional     -> `hold` parks the job (driver skips it until unheld)
 #
 # Env:
 #   S3_BUCKET        (default ai2050-ersilia-cluster)   passed through to the orchestrators
@@ -30,23 +40,30 @@
 #   AUTO_FETCH_SIF   0 | 1             (default 0 — do NOT download; missing SIF => missing-files)
 #   LOG_DIR          (default /shared/logs/scheduler)
 #   STATE_FILE       (default $LOG_DIR/state.tsv)
+#   STATUS_FILE      (default $LOG_DIR/status.tsv)
+#   CTL_POLL         (default 15)   how often to check control requests while a job runs
+#   IDLE_POLL        (default 30)   how often to re-read the queue when it has nothing runnable
+#   REFRESH_SECONDS  (default 300)  how often to re-count S3 progress for the running job
+#   EXIT_WHEN_EMPTY  0 | 1 (default 0 — idle and wait for queue changes instead of exiting)
 #   SCHED_FAKE_RC    (dry-run only) space-separated fake exit codes by queue index, for testing
+#   SCHED_FAKE_S3    (test only) 1 => count from a fixture instead of `aws s3 ls` (see the lib)
 # =============================================================================
 
 set -uo pipefail
 
 usage() {
-    sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-# ---- args: separate --dry-run flag from positionals ----
+# ---- args: separate flags from positionals ----
 DRY_RUN=0
 POS=()
 for a in "$@"; do
     case "$a" in
-        --dry-run) DRY_RUN=1 ;;
-        -h|--help) usage; exit 0 ;;
-        *)         POS+=("$a") ;;
+        --dry-run)         DRY_RUN=1 ;;
+        --exit-when-empty) EXIT_WHEN_EMPTY=1 ;;
+        -h|--help)         usage; exit 0 ;;
+        *)                 POS+=("$a") ;;
     esac
 done
 QUEUE_FILE="${POS[0]:-}"
@@ -61,10 +78,16 @@ ON_FAIL="${ON_FAIL:-continue}"
 AUTO_FETCH_SIF="${AUTO_FETCH_SIF:-0}"
 LOG_DIR="${LOG_DIR:-/shared/logs/scheduler}"
 STATE_FILE="${STATE_FILE:-${LOG_DIR}/state.tsv}"
+STATUS_FILE="${STATUS_FILE:-${LOG_DIR}/status.tsv}"
+CTL_POLL="${CTL_POLL:-15}"
+IDLE_POLL="${IDLE_POLL:-30}"
+REFRESH_SECONDS="${REFRESH_SECONDS:-300}"
+EXIT_WHEN_EMPTY="${EXIT_WHEN_EMPTY:-0}"
 declare -a FAKE_RC=(${SCHED_FAKE_RC:-})   # dry-run test hook (empty in normal use)
 
 if [ -z "$QUEUE_FILE" ]; then usage; exit 1; fi
 [ -f "$QUEUE_FILE" ] || { echo "ERROR: queue file not found: $QUEUE_FILE"; exit 1; }
+QUEUE_FILE="$(cd "$(dirname "$QUEUE_FILE")" && pwd)/$(basename "$QUEUE_FILE")"
 
 # ---- locate + source the shared lib ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -88,7 +111,7 @@ fi
 WAVES_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 [ -f "${WAVES_DIR}/submit-ersilia-waves.sh" ] || WAVES_DIR="/shared/scripts/large_library_scripts"
 
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$(control_dir)"
 
 # ---- single-driver lock (atomic mkdir) ----
 LOCK="${LOG_DIR}/.lock"
@@ -97,55 +120,182 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     echo "       If no scheduler is running, remove it:  rmdir $LOCK"
     exit 1
 fi
-cleanup() { rmdir "$LOCK" 2>/dev/null; rm -f "${STATE_FILE}.tmp.$$" 2>/dev/null; }
+cleanup() {
+    rmdir "$LOCK" 2>/dev/null
+    rm -f "${STATE_FILE}.tmp.$$" "$(status_file).tmp.$$" 2>/dev/null
+    rm -f "$(driver_info)" 2>/dev/null
+}
 trap cleanup EXIT
 
-# ---- state arrays (index-aligned) ----
-Q_MODEL=(); Q_MODE=(); Q_LIB=(); Q_WAVE=(); Q_QUEUE=()
+# ---- state arrays (index-aligned, rebuilt on every queue re-read) ----
+Q_MODEL=(); Q_MODE=(); Q_LIB=(); Q_WAVE=(); Q_QUEUE=(); Q_KEY=(); Q_HOLD=()
 Q_STATUS=(); Q_DONE=(); Q_TOTAL=(); Q_START=(); Q_FIN=(); Q_LOG=(); Q_NOTE=()
 
-log_line() { echo "[$(now_iso)] $*"; }
-set_status() { Q_STATUS[$1]="$2"; write_state; }   # $1=index $2=status
+# ---- control state ----
+CANCEL_KEYS=""          # space-separated keys with a pending cancel request
+STOP_AFTER=0            # finish the current job, then exit
+SHUTDOWN=0              # exit as soon as the current job settles
 
-add_job() {  # model mode library wave queue status note
+log_line() { echo "[$(now_iso)] $*"; }
+
+# =============================================================================
+# Queue parsing (re-run before every job)
+# =============================================================================
+
+add_job() {  # model mode library wave queue hold status note
     local i=${#Q_MODEL[@]}
     Q_MODEL[i]="$1"; Q_MODE[i]="$2"; Q_LIB[i]="$3"; Q_WAVE[i]="$4"; Q_QUEUE[i]="$5"
-    Q_STATUS[i]="$6"; Q_NOTE[i]="$7"
+    Q_HOLD[i]="$6"; Q_STATUS[i]="$7"; Q_NOTE[i]="$8"
+    Q_KEY[i]="$(job_key "$1" "$2" "$3")"
     Q_DONE[i]=0; Q_TOTAL[i]=0; Q_START[i]="-"; Q_FIN[i]="-"
-    Q_LOG[i]="${LOG_DIR}/$((i + 1))_${1}_${3:-NA}.log"
+    # Log name is derived from the job identity, not its queue position, so it is
+    # stable across reordering (positions change; the log must not follow).
+    Q_LOG[i]="${LOG_DIR}/${1}_${3:-NA}.log"
 }
 
-parse_queue() {
-    local raw trimmed f_model f_mode f_lib f_wave f_queue
+_parse_queue_unlocked() {
+    Q_MODEL=(); Q_MODE=(); Q_LIB=(); Q_WAVE=(); Q_QUEUE=(); Q_KEY=(); Q_HOLD=()
+    Q_STATUS=(); Q_DONE=(); Q_TOTAL=(); Q_START=(); Q_FIN=(); Q_LOG=(); Q_NOTE=()
+    local raw lib wave queue
     while IFS= read -r raw || [ -n "$raw" ]; do
-        trimmed="${raw#"${raw%%[![:space:]]*}"}"        # left-trim whitespace
-        case "$trimmed" in ''|'#'*) continue ;; esac    # blank / comment
-        read -r f_model f_mode f_lib f_wave f_queue _ <<< "$trimmed"
-        [ -z "$f_model" ] && continue
+        parse_queue_line "$raw" || continue
 
-        f_lib="${f_lib:-$DEFAULT_LIBRARY}"
-        f_wave="${f_wave:-$DEFAULT_WAVE_SIZE}"
-        f_queue="${f_queue:-$DEFAULT_QUEUE}"
+        lib="${QL_LIB:-$DEFAULT_LIBRARY}"
+        wave="${QL_WAVE:-$DEFAULT_WAVE_SIZE}"
+        queue="${QL_QUEUE:-$DEFAULT_QUEUE}"
 
-        if [ "$f_mode" != "ersilia" ] && [ "$f_mode" != "singularity" ]; then
-            add_job "$f_model" "${f_mode:-?}" "${f_lib:-NA}" "$f_wave" "$f_queue" \
-                    skipped "unknown mode '${f_mode:-}' (want ersilia|singularity)"
+        if [ "$QL_MODE" != "ersilia" ] && [ "$QL_MODE" != "singularity" ]; then
+            add_job "$QL_MODEL" "${QL_MODE:-?}" "${lib:-NA}" "$wave" "$queue" 0 \
+                    skipped "unknown mode '${QL_MODE:-}' (want ersilia|singularity)"
             continue
         fi
-        if [ -z "$f_lib" ]; then
-            add_job "$f_model" "$f_mode" "NA" "$f_wave" "$f_queue" \
+        if [ -z "$lib" ]; then
+            add_job "$QL_MODEL" "$QL_MODE" "NA" "$wave" "$queue" 0 \
                     skipped "no library and no default_library given"
             continue
         fi
-        f_lib="$(resolve_library "$f_lib")"
-        if ! [[ "$f_wave" =~ ^[0-9]+$ ]] || [ "$f_wave" -lt 1 ] || [ "$f_wave" -gt 1000 ]; then
-            add_job "$f_model" "$f_mode" "$f_lib" "$f_wave" "$f_queue" \
-                    skipped "wave_size '$f_wave' out of 1..1000"
+        lib="$(resolve_library "$lib")"
+        if ! [[ "$wave" =~ ^[0-9]+$ ]] || [ "$wave" -lt 1 ] || [ "$wave" -gt 1000 ]; then
+            add_job "$QL_MODEL" "$QL_MODE" "$lib" "$wave" "$queue" 0 \
+                    skipped "wave_size '$wave' out of 1..1000"
             continue
         fi
-        add_job "$f_model" "$f_mode" "$f_lib" "$f_wave" "$f_queue" pending ""
+        if [ "$QL_HOLD" = "1" ]; then
+            add_job "$QL_MODEL" "$QL_MODE" "$lib" "$wave" "$queue" 1 held "held in queue file"
+        else
+            add_job "$QL_MODEL" "$QL_MODE" "$lib" "$wave" "$queue" 0 pending ""
+        fi
     done < "$QUEUE_FILE"
 }
+
+parse_queue() { queue_locked _parse_queue_unlocked; }
+
+# Overlay the durable status store onto the freshly-parsed queue. Queue-file
+# verdicts (skipped, held) win over the store, since they describe the line as it
+# reads right now; everything else comes from the store.
+merge_status() {
+    status_load
+    local i k st
+    for i in "${!Q_MODEL[@]}"; do
+        k="${Q_KEY[i]}"
+        st="${ST_STATUS[$k]:-}"
+        [ -n "$st" ] || continue
+        Q_DONE[i]="${ST_DONE[$k]:-0}";   Q_TOTAL[i]="${ST_TOTAL[$k]:-0}"
+        Q_START[i]="${ST_START[$k]:--}"; Q_FIN[i]="${ST_FIN[$k]:--}"
+        [ -n "${ST_LOG[$k]:-}" ] && Q_LOG[i]="${ST_LOG[$k]}"
+        case "${Q_STATUS[i]}" in
+            skipped) continue ;;                                  # bad line: queue file wins
+            held)    [ "$st" = "done" ] && Q_STATUS[i]="done"      # a held-but-finished job
+                     continue ;;
+        esac
+        Q_STATUS[i]="$st"
+        Q_NOTE[i]="${ST_NOTE[$k]:-}"
+    done
+}
+
+# Persist one job's row back into the durable store, then refresh state.tsv.
+persist_job() {  # $1 = index
+    local i="$1" k="${Q_KEY[$1]}"
+    _do() {
+        status_load
+        ST_STATUS["$k"]="${Q_STATUS[i]}"; ST_DONE["$k"]="${Q_DONE[i]}"
+        ST_TOTAL["$k"]="${Q_TOTAL[i]}";   ST_START["$k"]="${Q_START[i]}"
+        ST_FIN["$k"]="${Q_FIN[i]}";       ST_LOG["$k"]="${Q_LOG[i]}"
+        ST_NOTE["$k"]="${Q_NOTE[i]}"
+        status_write
+    }
+    queue_locked _do
+    write_state
+}
+
+set_status() {  # $1=index $2=status [$3=note]
+    Q_STATUS[$1]="$2"
+    [ "$#" -ge 3 ] && Q_NOTE[$1]="$3"
+    persist_job "$1"
+}
+
+# =============================================================================
+# Control channel
+# =============================================================================
+
+# Consume every pending control message and update the flags. Cheap enough to
+# call on each poll tick.
+drain_control() {
+    local d f verb payload
+    d="$(control_dir)"
+    [ -d "$d" ] || return 0
+
+    STOP_AFTER=0
+    [ -f "$(stopafter_flag)" ] && STOP_AFTER=1
+
+    for f in "$d"/*.cancel "$d"/*.shutdown "$d"/*.refresh; do
+        [ -f "$f" ] || continue
+        verb="${f##*.}"
+        payload="$(head -n 1 "$f" 2>/dev/null)"
+        rm -f "$f"
+        case "$verb" in
+            cancel)
+                CANCEL_KEYS="${CANCEL_KEYS} ${payload}"
+                log_line "control: cancel requested for '${payload}'"
+                ;;
+            shutdown)
+                SHUTDOWN=1
+                log_line "control: shutdown requested"
+                ;;
+            refresh)
+                FORCE_REFRESH=1
+                log_line "control: S3 recount requested"
+                ;;
+        esac
+    done
+}
+
+is_paused() { [ -f "$(paused_flag)" ]; }
+
+# Does a cancel request name this job? Matches the full key or just the model id,
+# so `sched-ctl.sh cancel eos12x7_v1` works without spelling out mode/library.
+cancel_wanted() {  # $1 = key
+    local key="$1" model="${1%%|*}" want
+    for want in $CANCEL_KEYS; do
+        [ "$want" = "$key" ] && return 0
+        [ "$want" = "$model" ] && return 0
+    done
+    return 1
+}
+
+cancel_clear() {  # $1 = key — drop satisfied requests
+    local key="$1" model="${1%%|*}" want keep=""
+    for want in $CANCEL_KEYS; do
+        [ "$want" = "$key" ] && continue
+        [ "$want" = "$model" ] && continue
+        keep="${keep} ${want}"
+    done
+    CANCEL_KEYS="$keep"
+}
+
+# =============================================================================
+# Dispatch
+# =============================================================================
 
 ensure_sif() {  # $1=model $2=logfile ; 0 if present (or fetched), 1 otherwise
     local m="$1" logf="$2"
@@ -161,72 +311,141 @@ ensure_sif() {  # $1=model $2=logfile ; 0 if present (or fetched), 1 otherwise
     return 1
 }
 
-run_queue() {
-    local i model mode lib wave queue script rc total_jobs=${#Q_MODEL[@]}
-    local fails=0
-    for i in "${!Q_MODEL[@]}"; do
-        model="${Q_MODEL[i]}"; mode="${Q_MODE[i]}"; lib="${Q_LIB[i]}"
-        wave="${Q_WAVE[i]}"; queue="${Q_QUEUE[i]}"
+# Cancel the orchestrator we launched, plus whatever it has in flight on SLURM.
+# Array job ids are scraped from THIS JOB'S LOG ONLY, so we can never scancel a
+# job the scheduler did not start.
+cancel_child() {  # $1 = logfile
+    local logf="$1" aid
+    if [ -f "$logf" ]; then
+        for aid in $(grep -oP 'Submitted (array|batch) job \K[0-9]+' "$logf" 2>/dev/null | sort -u); do
+            log_line "  scancel ${aid}"
+            scancel "$aid" 2>/dev/null
+        done
+    fi
+    if [ -n "${CHILD_PGID:-}" ]; then
+        log_line "  terminating orchestrator process group ${CHILD_PGID}"
+        kill -TERM -"$CHILD_PGID" 2>/dev/null
+        local waited=0
+        while kill -0 "$CHILD_PID" 2>/dev/null && [ "$waited" -lt 10 ]; do
+            sleep 1; waited=$((waited + 1))
+        done
+        kill -0 "$CHILD_PID" 2>/dev/null && kill -KILL -"$CHILD_PGID" 2>/dev/null
+    fi
+}
 
-        if [ "${Q_STATUS[i]}" != "pending" ]; then
-            log_line "job $((i + 1))/${total_jobs}: ${model} (${mode}) -> ${Q_STATUS[i]} :: ${Q_NOTE[i]}"
-            continue
-        fi
+# Run one queue entry to completion (or cancellation). Returns the child's rc,
+# or 130 if it was cancelled.
+run_job() {  # $1 = index
+    local i="$1"
+    local model="${Q_MODEL[i]}" mode="${Q_MODE[i]}" lib="${Q_LIB[i]}"
+    local wave="${Q_WAVE[i]}" queue="${Q_QUEUE[i]}" key="${Q_KEY[i]}"
+    local script rc cancelled=0 last_refresh=0 nowsec
 
-        log_line "----- job $((i + 1))/${total_jobs} : ${model} (${mode}) on ${lib} -----"
+    log_line "----- ${model} (${mode}) on ${lib}  [queue pos $((i + 1))/${#Q_MODEL[@]}] -----"
 
-        # resume fast-skip: already complete in S3?
-        Q_TOTAL[i]="$(s3_count_input "$lib")"
-        Q_DONE[i]="$(s3_count_output "$model" "$lib" "$mode")"
-        write_state
-        if [ "${Q_TOTAL[i]}" -gt 0 ] && [ "${Q_DONE[i]}" -ge "${Q_TOTAL[i]}" ]; then
-            set_status "$i" done
-            log_line "  already complete in S3 (${Q_DONE[i]}/${Q_TOTAL[i]}) — skipping dispatch"
-            continue
-        fi
-
-        Q_START[i]="$(now_iso)"
-        set_status "$i" running
-
-        # pre-flight: SIF present (no download unless AUTO_FETCH_SIF=1)
-        if ! ensure_sif "$model" "${Q_LOG[i]}"; then
-            Q_FIN[i]="$(now_iso)"; set_status "$i" missing-files
-            log_line "  SIF not found: /shared/sif-files/${model}.sif — missing-files, continuing"
-            continue
-        fi
-        # pre-flight: input library must have chunks in S3
-        if [ "${Q_TOTAL[i]}" -le 0 ]; then
-            Q_FIN[i]="$(now_iso)"; set_status "$i" missing-files
-            log_line "  no input chunks in s3://${S3_BUCKET}/input/${lib}/ — missing-files, continuing"
-            continue
-        fi
-
-        script="${WAVES_DIR}/$(mode_script "$mode")"
-        if [ "$DRY_RUN" -eq 1 ]; then
-            log_line "  [dry-run] S3_BUCKET=$S3_BUCKET POLL_SECONDS=$POLL_SECONDS $script $model $lib $wave $queue"
-            rc="${FAKE_RC[i]:-0}"
-        else
-            log_line "  dispatch: $script $model $lib $wave $queue  (log: ${Q_LOG[i]})"
-            S3_BUCKET="$S3_BUCKET" POLL_SECONDS="$POLL_SECONDS" \
-                "$script" "$model" "$lib" "$wave" "$queue" 2>&1 | tee -a "${Q_LOG[i]}"
-            rc="${PIPESTATUS[0]}"
-        fi
-
+    # resume fast-skip: already complete in S3?
+    Q_TOTAL[i]="$(s3_count_input "$lib")"
+    Q_DONE[i]="$(s3_count_output "$model" "$lib" "$mode")"
+    if [ "${Q_TOTAL[i]}" -gt 0 ] && [ "${Q_DONE[i]}" -ge "${Q_TOTAL[i]}" ]; then
         Q_FIN[i]="$(now_iso)"
-        Q_DONE[i]="$(s3_count_output "$model" "$lib" "$mode")"
-        if [ "$rc" -eq 0 ]; then
-            set_status "$i" done
-            log_line "  done (${Q_DONE[i]}/${Q_TOTAL[i]})"
-        else
-            set_status "$i" failed; fails=$((fails + 1))
-            log_line "  FAILED rc=$rc (${Q_DONE[i]}/${Q_TOTAL[i]})"
-            if [ "$ON_FAIL" = "halt" ]; then
-                log_line "ON_FAIL=halt — stopping the queue at job $((i + 1))."
-                return 1
-            fi
+        set_status "$i" done "already complete in S3"
+        log_line "  already complete in S3 (${Q_DONE[i]}/${Q_TOTAL[i]}) — skipping dispatch"
+        return 0
+    fi
+
+    Q_START[i]="$(now_iso)"; Q_FIN[i]="-"
+    set_status "$i" running ""
+
+    # pre-flight: SIF present (no download unless AUTO_FETCH_SIF=1).
+    # Skipped under --dry-run: a dry run must not depend on /shared/sif-files, so the
+    # dispatch/poll/cancel path stays testable off-cluster.
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_line "  [dry-run] skipping SIF pre-flight for ${model}"
+    elif ! ensure_sif "$model" "${Q_LOG[i]}"; then
+        Q_FIN[i]="$(now_iso)"
+        set_status "$i" missing-files "SIF not found: /shared/sif-files/${model}.sif"
+        log_line "  SIF not found: /shared/sif-files/${model}.sif — missing-files, continuing"
+        return 0
+    fi
+    # pre-flight: input library must have chunks in S3
+    if [ "${Q_TOTAL[i]}" -le 0 ]; then
+        Q_FIN[i]="$(now_iso)"
+        set_status "$i" missing-files "no input chunks in s3://${S3_BUCKET}/input/${lib}/"
+        log_line "  no input chunks in s3://${S3_BUCKET}/input/${lib}/ — missing-files, continuing"
+        return 0
+    fi
+
+    script="${WAVES_DIR}/$(mode_script "$mode")"
+
+    # Launch in its own process group (setsid) so a cancel can take down the whole
+    # tree, and in the background so this driver keeps servicing control requests.
+    # Output goes to the per-job log; `tee` would break pid/pgid tracking.
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_line "  [dry-run] S3_BUCKET=$S3_BUCKET POLL_SECONDS=$POLL_SECONDS $script $model $lib $wave $queue"
+        # A real sleeping child, so the poll/cancel path is genuinely exercised.
+        setsid sleep "${SCHED_FAKE_DURATION:-30}" >>"${Q_LOG[i]}" 2>&1 &
+    else
+        log_line "  dispatch: $script $model $lib $wave $queue  (log: ${Q_LOG[i]})"
+        S3_BUCKET="$S3_BUCKET" POLL_SECONDS="$POLL_SECONDS" \
+            setsid "$script" "$model" "$lib" "$wave" "$queue" >>"${Q_LOG[i]}" 2>&1 &
+    fi
+    CHILD_PID=$!
+    CHILD_PGID="$(ps -o pgid= -p "$CHILD_PID" 2>/dev/null | tr -d ' ')"
+    : "${CHILD_PGID:=$CHILD_PID}"
+
+    while kill -0 "$CHILD_PID" 2>/dev/null; do
+        drain_control
+        if [ "$SHUTDOWN" -eq 1 ] || cancel_wanted "$key"; then
+            cancelled=1
+            cancel_child "${Q_LOG[i]}"
+            cancel_clear "$key"
+            break
         fi
+        nowsec="$(date -u +%s)"
+        if [ -n "${FORCE_REFRESH:-}" ] || [ $((nowsec - last_refresh)) -ge "$REFRESH_SECONDS" ]; then
+            FORCE_REFRESH=""
+            last_refresh="$nowsec"
+            Q_DONE[i]="$(s3_count_output "$model" "$lib" "$mode")"
+            persist_job "$i"
+        fi
+        sleep "$CTL_POLL"
     done
-    [ "$fails" -eq 0 ] && return 0 || return 1
+
+    wait "$CHILD_PID" 2>/dev/null; rc=$?
+    [ "$DRY_RUN" -eq 1 ] && [ "$cancelled" -eq 0 ] && rc="${FAKE_RC[i]:-0}"
+    CHILD_PID=""; CHILD_PGID=""
+
+    Q_FIN[i]="$(now_iso)"
+    Q_DONE[i]="$(s3_count_output "$model" "$lib" "$mode")"
+
+    if [ "$cancelled" -eq 1 ]; then
+        set_status "$i" cancelled "cancelled by request at ${Q_FIN[i]}"
+        log_line "  CANCELLED (${Q_DONE[i]}/${Q_TOTAL[i]})"
+        return 130
+    fi
+    if [ "$rc" -eq 0 ]; then
+        set_status "$i" done ""
+        log_line "  done (${Q_DONE[i]}/${Q_TOTAL[i]})"
+    else
+        set_status "$i" failed "orchestrator exited rc=$rc"
+        log_line "  FAILED rc=$rc (${Q_DONE[i]}/${Q_TOTAL[i]})"
+    fi
+    return "$rc"
+}
+
+# =============================================================================
+# Main loop
+# =============================================================================
+
+# First index whose status is pending and which is not held. Echoes nothing when
+# there is no runnable job.
+next_runnable() {
+    local i
+    for i in "${!Q_MODEL[@]}"; do
+        [ "${Q_HOLD[i]}" = "1" ] && continue
+        [ "${Q_STATUS[i]}" = "pending" ] && { echo "$i"; return 0; }
+    done
+    return 1
 }
 
 summary() {
@@ -234,7 +453,7 @@ summary() {
     declare -A c=()
     for i in "${!Q_MODEL[@]}"; do s="${Q_STATUS[i]}"; c[$s]=$(( ${c[$s]:-0} + 1 )); done
     local line=""
-    for s in done running pending failed missing-files skipped; do
+    for s in $SCHED_STATUSES; do
         [ -n "${c[$s]:-}" ] && line+="${s}=${c[$s]}  "
     done
     echo "=========================================="
@@ -244,22 +463,108 @@ summary() {
     echo "=========================================="
 }
 
-# ---- run ----
+# ---- announce ourselves so sched-ctl.sh / the TUI can find this instance ----
+write_driver_info <<EOF
+pid=$$
+queue_file=$QUEUE_FILE
+log_dir=$LOG_DIR
+state_file=$STATE_FILE
+status_file=$STATUS_FILE
+script_dir=$SCRIPT_DIR
+s3_bucket=$S3_BUCKET
+default_library=$DEFAULT_LIBRARY
+default_wave_size=$DEFAULT_WAVE_SIZE
+default_queue=$DEFAULT_QUEUE
+on_fail=$ON_FAIL
+dry_run=$DRY_RUN
+exit_when_empty=$EXIT_WHEN_EMPTY
+tmux_session=${SCHEDULER_TMUX:-}
+started=$(now_iso)
+EOF
+
 echo "=========================================="
 echo "Wave scheduler (driver)"
-echo "  Queue      : $QUEUE_FILE"
+echo "  Queue      : $QUEUE_FILE   (re-read before every job)"
 echo "  Default lib: ${DEFAULT_LIBRARY:-<none>}   wave=$DEFAULT_WAVE_SIZE   queue=$DEFAULT_QUEUE"
 echo "  Orchestr.  : $WAVES_DIR/submit-{ersilia,singularity}-waves.sh"
 echo "  On fail    : $ON_FAIL     Auto-fetch SIF: $AUTO_FETCH_SIF     Dry-run: $DRY_RUN"
 echo "  State file : $STATE_FILE"
+echo "  Control    : ${SCRIPT_DIR}/sched-ctl.sh   (add / rm / top / hold / cancel / pause)"
+echo "  Idle mode  : $([ "$EXIT_WHEN_EMPTY" = "1" ] && echo 'exit when queue empty' || echo 'stay up and wait for queue changes')"
 echo "=========================================="
 
-parse_queue
-if [ "${#Q_MODEL[@]}" -eq 0 ]; then
-    echo "Queue is empty (all blank/comment lines) — nothing to do."
-    exit 0
-fi
-write_state
-run_queue; RC=$?
+RC=0
+FAILS=0
+IDLE_ANNOUNCED=0
+
+while :; do
+    drain_control
+    if [ "$SHUTDOWN" -eq 1 ]; then
+        log_line "shutdown requested — exiting."
+        break
+    fi
+
+    if is_paused; then
+        if [ "$IDLE_ANNOUNCED" != "paused" ]; then
+            log_line "PAUSED (sched-ctl.sh resume to continue)"
+            IDLE_ANNOUNCED=paused
+        fi
+        sleep "$CTL_POLL"
+        continue
+    fi
+
+    parse_queue
+    merge_status
+    write_state
+
+    if [ "${#Q_MODEL[@]}" -eq 0 ]; then
+        if [ "$EXIT_WHEN_EMPTY" = "1" ]; then
+            echo "Queue is empty (all blank/comment lines) — nothing to do."
+            break
+        fi
+        if [ "$IDLE_ANNOUNCED" != "empty" ]; then
+            log_line "queue file has no jobs — waiting for additions (sched-ctl.sh add ...)"
+            IDLE_ANNOUNCED=empty
+        fi
+        sleep "$IDLE_POLL"
+        continue
+    fi
+
+    if ! IDX="$(next_runnable)"; then
+        if [ "$STOP_AFTER" -eq 1 ]; then
+            log_line "stop-after-current satisfied and nothing runnable — exiting."
+            rm -f "$(stopafter_flag)"
+            break
+        fi
+        if [ "$EXIT_WHEN_EMPTY" = "1" ]; then
+            break
+        fi
+        if [ "$IDLE_ANNOUNCED" != "idle" ]; then
+            log_line "nothing runnable (all done/failed/held) — waiting for queue changes"
+            IDLE_ANNOUNCED=idle
+        fi
+        sleep "$IDLE_POLL"
+        continue
+    fi
+    IDLE_ANNOUNCED=0
+
+    run_job "$IDX"; JOB_RC=$?
+    if [ "$JOB_RC" -ne 0 ] && [ "$JOB_RC" -ne 130 ]; then
+        FAILS=$((FAILS + 1))
+        if [ "$ON_FAIL" = "halt" ]; then
+            log_line "ON_FAIL=halt — stopping the queue."
+            RC=1
+            break
+        fi
+    fi
+
+    if [ "$STOP_AFTER" -eq 1 ]; then
+        log_line "stop-after-current — exiting after ${Q_MODEL[IDX]}."
+        rm -f "$(stopafter_flag)"
+        break
+    fi
+done
+
+[ "$FAILS" -gt 0 ] && RC=1
 summary
 exit "$RC"

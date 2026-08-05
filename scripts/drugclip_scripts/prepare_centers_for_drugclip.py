@@ -86,12 +86,34 @@ def last_serial(atom_lines):
     return 1
 
 
-def make_hetatm_line(serial, x, y, z, resname="LIG", chain="L", resnum=1):
-    # Matches prepare_fpocket_for_drugclip.py's dummy-ligand format exactly.
+def make_hetatm_line(serial, x, y, z, name="C1", resname="LIG", chain="L", resnum=1):
+    # Fixed-width columns so coords always land at 31-54 regardless of atom-name length.
     return (
-        f"HETATM{serial:5d}  C1  {resname:3s} {chain}{resnum:4d}    "
+        f"HETATM{serial:5d} {name:>4s} {resname:>3s} {chain}{resnum:4d}    "
         f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C  \n"
     )
+
+
+def probe_points(center, radius, spacing):
+    """Dummy-atom positions approximating a pocket-filling molecule.
+
+    radius == 0 → a single atom at the center (original behaviour). radius > 0 → a
+    filled ball (cubic grid, `spacing` A) of dummy atoms of the given radius, so that
+    encode_pockets' 6 A ligand-selection captures residues out to ~(radius+6) A of the
+    center — mimicking the paper's "residues within 6 A of the generated ligand".
+    """
+    cx, cy, cz = center
+    if radius <= 0:
+        return [(cx, cy, cz)]
+    pts = []
+    n = max(1, int(radius // spacing))
+    for i in range(-n, n + 1):
+        for j in range(-n, n + 1):
+            for k in range(-n, n + 1):
+                dx, dy, dz = i * spacing, j * spacing, k * spacing
+                if dx * dx + dy * dy + dz * dz <= radius * radius:
+                    pts.append((cx + dx, cy + dy, cz + dz))
+    return pts or [(cx, cy, cz)]
 
 
 def main():
@@ -102,6 +124,12 @@ def main():
                     help="Output pockets dir; writes <stem>_LIG.pdb + manifest.csv here")
     ap.add_argument("--dry-run", action="store_true",
                     help="Report what would be written without writing PDBs")
+    ap.add_argument("--probe-radius", type=float, default=0.0,
+                    help="0 = single dummy atom at center (default); >0 = filled ball of dummy "
+                         "atoms of this radius (A), approximating the paper's pocket-filling ligand "
+                         "so ~(radius+6) A of residues are selected.")
+    ap.add_argument("--probe-spacing", type=float, default=2.0,
+                    help="Grid spacing (A) for the dummy-atom ball when --probe-radius > 0.")
     args = ap.parse_args()
 
     target_dir = os.path.abspath(args.target_dir)
@@ -161,9 +189,12 @@ def main():
 
             if not args.dry_run:
                 out_path = os.path.join(args.out_dir, out_name)
+                pts = probe_points(center, args.probe_radius, args.probe_spacing)
+                s0 = last_serial(atoms)
                 with open(out_path, "w") as f:
                     f.writelines(atoms)
-                    f.write(make_hetatm_line(last_serial(atoms), *center))
+                    for pi, (px, py, pz) in enumerate(pts):
+                        f.write(make_hetatm_line(s0 + pi, px, py, pz, name=f"C{pi + 1}"))
             n_written += 1
 
             manifest.append({
