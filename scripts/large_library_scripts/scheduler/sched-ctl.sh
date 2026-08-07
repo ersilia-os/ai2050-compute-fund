@@ -238,15 +238,22 @@ move_block() {
 # Resolve a selector (model id or 1-based position) to 0-based block indices.
 # Echoes one index per line; empty output means "no match".
 resolve_sel() {  # $1 = selector
-    local sel="$1" i found=0
+    local sel="$1" i found=0 hits=()
     if [[ "$sel" =~ ^[0-9]+$ ]]; then
         i=$((sel - 1))
         if [ "$i" -ge 0 ] && [ "$i" -lt "${#BLK_MODEL[@]}" ]; then echo "$i"; return 0; fi
         return 1
     fi
     for i in "${!BLK_MODEL[@]}"; do
-        if [ "${BLK_MODEL[i]}" = "$sel" ]; then echo "$i"; found=1; fi
+        if [ "${BLK_MODEL[i]}" = "$sel" ]; then echo "$i"; hits+=("$((i + 1))"); found=1; fi
     done
+    # The same model can legitimately appear twice against different libraries.
+    # Callers act on the first match, so say so rather than let the user believe
+    # they held or cancelled the other one.
+    if [ "${#hits[@]}" -gt 1 ]; then
+        echo "warning: '$sel' matches queue positions ${hits[*]} — acting on ${hits[0]}." >&2
+        echo "         Use the position number to pick a specific one." >&2
+    fi
     [ "$found" -eq 1 ]
 }
 
@@ -286,13 +293,39 @@ cmd_add() {
         echo "ERROR: wave_size must be 1..1000 (got '$wave')" >&2; return 1
     fi
 
+    # Fill in skipped positional fields.
+    #
+    # Queue fields are whitespace-delimited, so an EMPTY middle field is invisible
+    # once written: `model mode <blank> 500` re-reads as library=500, and
+    # `model mode lib <blank> gpu-queue` re-reads as wave_size=gpu-queue. Either way
+    # the job is silently mis-parsed later — wrong S3 prefix, or rejected as an
+    # out-of-range wave. So anything to the left of a value you did give must be
+    # materialised from the driver's defaults before the line is written.
+    if [ -n "$queue" ] && [ -z "$wave" ]; then
+        wave="${DI_default_wave_size:-1000}"
+    fi
+    if { [ -n "$wave" ] || [ -n "$queue" ]; } && [ -z "$lib" ]; then
+        lib="${DI_default_library:-}"
+        if [ -z "$lib" ]; then
+            echo "ERROR: a wave_size or partition was given without a library, and no" >&2
+            echo "       default_library is available (is a driver running?)." >&2
+            echo "       Name the library explicitly:  add $model $mode <library> ${wave:-} ${queue:-}" >&2
+            return 1
+        fi
+        echo "note: library not given — using the driver default '$lib'" >&2
+    fi
+
     _do() {
         load_blocks
-        local i
+        # Compare RESOLVED libraries: `molport` and Molport_Screening_Compounds_5.3M
+        # are the same job, and so are an explicit library and a blank one that falls
+        # back to the same default. A duplicate would give two queue lines one shared
+        # status key, so the second silently inherits the first's verdict.
+        local i want; want="$(effective_library "$lib")"
         for i in "${!BLK_MODEL[@]}"; do
             if [ "${BLK_MODEL[i]}" = "$model" ] && [ "${BLK_MODE[i]}" = "$mode" ] \
-               && [ "${BLK_LIB[i]}" = "$lib" ]; then
-                echo "already queued at position $((i + 1)): $model $mode ${lib:-<default>}" >&2
+               && [ "$(effective_library "${BLK_LIB[i]}")" = "$want" ]; then
+                echo "already queued at position $((i + 1)): $model $mode ${want:-<default>}" >&2
                 return 1
             fi
         done
@@ -378,21 +411,30 @@ cmd_move() {
 
 cmd_retry() {
     [ "$#" -ge 1 ] || { echo "ERROR: retry needs at least one <sel>" >&2; return 1; }
-    load_blocks
-    local sel idx key rc=0
-    for sel in "$@"; do
-        idx="$(resolve_sel "$sel" | head -n 1)" || {
-            echo "ERROR: no queue entry matches '$sel'" >&2; rc=1; continue; }
-        # Reproduce the driver's key exactly: default applied, then alias-resolved.
-        key="$(job_key "${BLK_MODEL[idx]}" "${BLK_MODE[idx]}" \
-                       "$(effective_library "${BLK_LIB[idx]}")")"
-        status_forget "$key"
-        set_hold_flag "$idx" 0
-        echo "retry: ${BLK_MODEL[idx]} (verdict cleared, unheld)"
-    done
-    _w() { write_blocks; }
-    queue_locked _w
-    return "$rc"
+    local sels=("$@")
+    # Read AND write inside one lock. Loading the blocks outside it and writing them
+    # back later would silently discard any edit made in between — the driver could
+    # be re-reading, or the TUI reordering, at exactly that moment.
+    _do() {
+        load_blocks
+        status_load
+        local sel idx key rc=0
+        for sel in "${sels[@]}"; do
+            idx="$(resolve_sel "$sel" | head -n 1)" || {
+                echo "ERROR: no queue entry matches '$sel'" >&2; rc=1; continue; }
+            # Reproduce the driver's key exactly: default applied, then alias-resolved.
+            key="$(job_key "${BLK_MODEL[idx]}" "${BLK_MODE[idx]}" \
+                           "$(effective_library "${BLK_LIB[idx]}")")"
+            unset "ST_STATUS[$key]" "ST_DONE[$key]" "ST_TOTAL[$key]" \
+                  "ST_START[$key]" "ST_FIN[$key]" "ST_LOG[$key]" "ST_NOTE[$key]"
+            set_hold_flag "$idx" 0
+            echo "retry: ${BLK_MODEL[idx]} (verdict cleared, unheld)"
+        done
+        status_write
+        write_blocks
+        return "$rc"
+    }
+    queue_locked _do
 }
 
 # Status of a model according to the render view (no S3 calls).
@@ -449,12 +491,18 @@ cmd_list() {
         key="$(job_key "${BLK_MODEL[i]}" "${BLK_MODE[i]}" "$lib")"
         st="${ST_STATUS[$key]:-pending}"
         dn="${ST_DONE[$key]:-0}"; tt="${ST_TOTAL[$key]:-0}"
-        case " ${BLK_FLAGS[i]} " in *" hold "*) st="held" ;; esac
+        # `hold` outranks only `pending`. A real verdict — running, cancelled,
+        # failed — is what you need to see, and the flag is still shown in the
+        # flags column. Overriding unconditionally made a cancelled job read as
+        # "held", which hides the very thing you just did.
+        case " ${BLK_FLAGS[i]} " in
+            *" hold "*) [ "$st" = "pending" ] && st="held" ;;
+        esac
         printf '%-4s %-19s %-12s %-34s %-13s %6s/%-7s %s\n' \
             "$((i + 1))" "${BLK_MODEL[i]}" "${BLK_MODE[i]}" "${lib:-<no default>}" \
             "$st" "$dn" "$tt" "${BLK_FLAGS[i]}"
     done
-    printf -- '-%.0s' {1..100}; echo ""
+    printf -- '-%.0s' {1..108}; echo ""
     if driver_alive; then
         if [ -f "$(paused_flag)" ]; then echo "  driver: PAUSED (pid ${DI_pid})"
         else echo "  driver: running (pid ${DI_pid})"; fi
@@ -598,7 +646,7 @@ cmd_dump() {
 # Dispatch
 # =============================================================================
 case "$CMD" in
-    add)                need_queue; cmd_add "$@" ;;
+    add)                need_queue; read_driver_info >/dev/null 2>&1; cmd_add "$@" ;;
     rm|remove)          need_queue; apply_sel mut_rm "$@" ;;
     top)                need_queue; apply_sel mut_top "$@" ;;
     up)                 need_queue; apply_sel mut_up "$@" ;;

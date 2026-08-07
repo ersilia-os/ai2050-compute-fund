@@ -56,9 +56,19 @@ def elide(text: str, width: int) -> str:
     return text[: width - 1] + "…"
 
 
-def status_text(status: str) -> Text:
-    colour, glyph = _pal().status_style(status)
-    return Text(f"{glyph} {status}", style=colour)
+def status_text(status: str, held: bool = False) -> Text:
+    """The status cell.
+
+    `held` is shown as a trailing marker rather than by replacing the status,
+    because a job can be both held and cancelled/failed and you need to see both:
+    the verdict says what happened, the marker says it will not be retried.
+    """
+    pal = _pal()
+    colour, glyph = pal.status_style(status)
+    out = Text(f"{glyph} {status}", style=colour)
+    if held and status != "held":
+        out.append("  ‖", style=pal.status_style("held")[0])
+    return out
 
 
 def progress_bar(done: int, total: int, status: str, width: int = BAR_WIDTH) -> Text:
@@ -203,7 +213,7 @@ class QueueTable(DataTable):
                 Text(elide(job.model, 20), style=model_style),
                 Text(job.mode or "?", style=pal.dim),
                 Text(elide(library, self._library_width), style=pal.text),
-                status_text(job.status),
+                status_text(job.status, job.hold),
                 counts_text(job.done, job.total),
                 progress_bar(job.done, job.total, job.status, self._bar_width),
                 key=job.model,

@@ -113,12 +113,27 @@ queue_lock_file() { echo "${LOG_DIR}/.queue.lock"; }
 # Uses fd 9. flock is in util-linux and present on AL2/AL2023 and on macOS only
 # via util-linux, so fall back to a bounded mkdir spin when it is missing.
 queue_locked() {
+    # Re-entrancy guard. Nesting would run `exec 9>>` a second time, which replaces
+    # fd 9's open file description and RELEASES the outer flock — the caller would
+    # carry on believing it still held the lock. Running the inner command directly
+    # is correct: we already hold it.
+    if [ "${QUEUE_LOCK_DEPTH:-0}" -gt 0 ]; then
+        "$@"
+        return $?
+    fi
+
     mkdir -p "$LOG_DIR"
     local lf; lf="$(queue_lock_file)"
     if command -v flock >/dev/null 2>&1; then
         exec 9>>"$lf" || { echo "ERROR: cannot open queue lock $lf" >&2; return 1; }
-        flock -w 30 9 || { echo "ERROR: timed out waiting for queue lock $lf" >&2; return 1; }
+        if ! flock -w 30 9; then
+            echo "ERROR: timed out waiting for queue lock $lf" >&2
+            exec 9>&-
+            return 1
+        fi
+        QUEUE_LOCK_DEPTH=1
         "$@"; local rc=$?
+        QUEUE_LOCK_DEPTH=0
         exec 9>&-
         return "$rc"
     fi
@@ -128,7 +143,9 @@ queue_locked() {
         [ "$spin" -gt 300 ] && { echo "ERROR: timed out waiting for queue lock $d" >&2; return 1; }
         sleep 0.1
     done
+    QUEUE_LOCK_DEPTH=1
     "$@"; local rc=$?
+    QUEUE_LOCK_DEPTH=0
     rmdir "$d" 2>/dev/null
     return "$rc"
 }

@@ -205,8 +205,13 @@ merge_status() {
         [ -n "${ST_LOG[$k]:-}" ] && Q_LOG[i]="${ST_LOG[$k]}"
         case "${Q_STATUS[i]}" in
             skipped) continue ;;                                  # bad line: queue file wins
-            held)    [ "$st" = "done" ] && Q_STATUS[i]="done"      # a held-but-finished job
-                     continue ;;
+            held)
+                # `hold` outranks only `pending`. It stops a job being STARTED; it
+                # does not stop one already in flight, and it must not mask a real
+                # verdict — a cancelled-then-held job reading as "held" hides the
+                # very thing you just did.
+                [ "$st" = "pending" ] || Q_STATUS[i]="$st"
+                continue ;;
         esac
         Q_STATUS[i]="$st"
         Q_NOTE[i]="${ST_NOTE[$k]:-}"
@@ -226,6 +231,33 @@ persist_job() {  # $1 = index
     }
     queue_locked _do
     write_state
+}
+
+# Reset leftover `running` verdicts to pending at startup.
+#
+# We only reach here holding the exclusive single-driver lock, so by definition no
+# other driver is alive — any row still marked `running` was left behind by one that
+# died mid-job (Spot preemption, a killed tmux, SIGKILL). Without this the job is
+# neither running nor pending: it gets skipped forever while the driver idles, which
+# is exactly the failure this scheduler exists to survive.
+#
+# Its finished chunks are already in S3, so re-dispatching resumes rather than redoing.
+reclaim_stale_running() {
+    _do() {
+        status_load
+        local key changed=0
+        for key in "${!ST_STATUS[@]}"; do
+            [ "${ST_STATUS[$key]}" = "running" ] || continue
+            ST_STATUS["$key"]="pending"
+            ST_FIN["$key"]="-"
+            ST_NOTE["$key"]="reclaimed at startup (previous driver died mid-job)"
+            changed=1
+            log_line "reclaimed interrupted job: ${key%%|*} (was 'running' — will resume)"
+        done
+        [ "$changed" -eq 1 ] && status_write
+        return 0
+    }
+    queue_locked _do
 }
 
 set_status() {  # $1=index $2=status [$3=note]
@@ -496,6 +528,8 @@ echo "=========================================="
 RC=0
 FAILS=0
 IDLE_ANNOUNCED=0
+
+reclaim_stale_running
 
 while :; do
     drain_control

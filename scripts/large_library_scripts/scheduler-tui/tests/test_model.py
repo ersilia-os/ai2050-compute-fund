@@ -122,8 +122,34 @@ class TestSnapshot:
         assert (job.done, job.total, job.pct) == (4102, 13644, 30)
         assert job.log == "/l/b.log"
 
-    def test_hold_flag_wins(self):
+    def test_hold_wins_over_pending(self):
         assert self.snap.find("eos6ojg_v1").status == "held"
+
+    def test_hold_does_not_mask_running(self):
+        """`hold` stops a job being STARTED; it does not stop one in flight, so a
+        held+running job must still read as running or you cannot see what to
+        cancel."""
+        dump = DUMP.replace(
+            "eos12x7_v1          ersilia      Enamine_Real_Sample_1.4B",
+            "eos12x7_v1          ersilia      Enamine_Real_Sample_1.4B     hold",
+        )
+        job = parse_dump(dump).find("eos12x7_v1")
+        assert job.status == "running"
+        assert job.hold  # the flag is still recorded, for the UI marker
+
+    def test_hold_does_not_mask_a_verdict(self):
+        """Holding a cancelled job must not make it read as merely 'held' — that
+        hides the cancellation you just performed."""
+        dump = DUMP.replace(
+            "eos12x7_v1|ersilia|Enamine_Real_Sample_1.4B\trunning",
+            "eos12x7_v1|ersilia|Enamine_Real_Sample_1.4B\tcancelled",
+        ).replace(
+            "eos12x7_v1          ersilia      Enamine_Real_Sample_1.4B",
+            "eos12x7_v1          ersilia      Enamine_Real_Sample_1.4B     hold",
+        )
+        job = parse_dump(dump).find("eos12x7_v1")
+        assert job.status == "cancelled"
+        assert job.hold
 
     def test_default_library_applied(self):
         job = self.snap.find("eos_default")

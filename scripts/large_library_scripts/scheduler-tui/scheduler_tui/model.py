@@ -429,9 +429,10 @@ def parse_dump(text: str) -> Snapshot:
             job.log = row.get("log", "")
             job.note = row.get("note", "")
 
-        # The queue file's own verdicts take precedence over the stored one: a
-        # line marked `hold` right now is held, whatever it did last time.
-        if job.hold and job.status not in ("done", "running"):
+        # `hold` outranks only `pending`. It stops a job being STARTED, so it must
+        # not mask a real verdict: a running job is still running, and a cancelled
+        # one must not read as "held". The flag stays visible as a marker.
+        if job.hold and job.status == "pending":
             job.status = "held"
         # A `running` row with no live driver is a leftover from a killed driver;
         # showing it as running would be a lie.
