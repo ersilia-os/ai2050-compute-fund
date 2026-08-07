@@ -204,7 +204,26 @@ LIMIT=200000 ./prepare-h3d-selected-library.sh ~/h3d_selected_100M.csv.gz ./smok
 ```
 
 Defaults: `LIB=Enamine_Real_h3d_selected`, `CHUNK_SIZE=50000`. Override any of
-`LIB CHUNK_SIZE S3_BUCKET SMILES_COL ID_COL DELIM LIMIT NO_UPLOAD` via env.
+`LIB CHUNK_SIZE S3_BUCKET SMILES_COL ID_COL DELIM LIMIT NO_UPLOAD` via env — the same
+wrapper builds any selected subset. Libraries built so far:
+
+| Library | Source | Molecules | Chunk size | Chunks |
+|---------|--------|-----------|------------|--------|
+| `Enamine_Real_h3d_selected`    | `44_key_input.csv.gz`    | 100M | 50,000 | ~2,000 |
+| `Enamine_Real_h3d_selected_1M` | `44_key_input_1M.csv.gz` | 1M   | 1,000  | 1,000  |
+
+```bash
+LIB=Enamine_Real_h3d_selected_1M CHUNK_SIZE=1000 \
+  ./prepare-h3d-selected-library.sh ~/Downloads/44_key_input_1M.csv.gz ./output
+```
+
+**Choosing a chunk size.** Every job pays a fixed container+model startup before its
+first molecule, so the startup cost is paid `n_chunks / n_concurrent_slots` times
+(~100 slots on `cpu-queue`). Large chunks amortize that; small chunks lose less work to
+a Spot preemption and even out stragglers. Rule of thumb: for a **fast** model size the
+chunks so `n_chunks` is 1–4× the slot count; for a **slow** model (≲5 mol/s) prefer
+small chunks so each job is minutes, not hours. The 1M library uses 1,000 — exactly
+SLURM's `MaxArraySize`, so it submits as a single array batch (0–999).
 A full run first does `gzip -t` (guards against ingesting a still-downloading file);
 skip with `SKIP_INTEGRITY_CHECK=1`. Re-running the same command **resumes**.
 

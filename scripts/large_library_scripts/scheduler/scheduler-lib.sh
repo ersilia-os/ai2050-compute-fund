@@ -51,10 +51,42 @@ _fake_s3_count() {  # $1 = kind (input|output), $2.. = key fields
 
 # Count a library's input chunks in S3:  <lib>_chunk_<NNN>.csv
 # Digit-count agnostic (3-digit small libs and 6-digit 1.4B both match).
+#
+# CACHED, because this is the single most expensive call in the whole scheduler and
+# the answer is effectively static: a library's chunk count only changes when the
+# library is re-ingested. Listing 13,639 objects is ~14 paged API calls plus AWS CLI
+# startup, and a full recount would otherwise pay that for every row sharing the
+# library. Set SCHED_INPUT_CACHE_TTL=0 to force a fresh count.
 s3_count_input() {  # $1 = library
     if [ "$SCHED_FAKE_S3" = "1" ]; then _fake_s3_count input "$1"; return 0; fi
-    aws s3 ls "s3://${S3_BUCKET}/input/${1}/" 2>/dev/null \
-        | grep -cP '_chunk_[0-9]+\.csv$' || true
+
+    local lib="$1" ttl="${SCHED_INPUT_CACHE_TTL:-3600}"
+    local cache="${LOG_DIR:-/tmp}/.input-counts" now val ts key
+    now="$(date -u +%s)"
+
+    if [ "$ttl" -gt 0 ] && [ -f "$cache" ]; then
+        while IFS=$'\t' read -r ts val key; do
+            [ "$key" = "$lib" ] || continue
+            if [ -n "$ts" ] && [ $((now - ts)) -lt "$ttl" ]; then
+                echo "$val"; return 0
+            fi
+            break
+        done < "$cache"
+    fi
+
+    val="$(aws s3 ls "s3://${S3_BUCKET}/input/${lib}/" 2>/dev/null \
+           | grep -cP '_chunk_[0-9]+\.csv$' || true)"
+    val="${val:-0}"
+
+    # Only cache a real answer: caching a 0 from a transient AWS failure would make
+    # every job look like it has no input until the TTL expired.
+    if [ "$val" -gt 0 ] && [ -n "${LOG_DIR:-}" ] && [ -d "$LOG_DIR" ]; then
+        {
+            [ -f "$cache" ] && awk -F'\t' -v L="$lib" '$3 != L' "$cache"
+            printf '%s\t%s\t%s\n' "$now" "$val" "$lib"
+        } > "${cache}.tmp.$$" 2>/dev/null && mv -f "${cache}.tmp.$$" "$cache" 2>/dev/null
+    fi
+    echo "$val"
 }
 
 # Count a model's result files in S3, per run mode.

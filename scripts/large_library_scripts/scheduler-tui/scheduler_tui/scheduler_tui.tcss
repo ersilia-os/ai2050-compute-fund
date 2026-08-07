@@ -196,13 +196,29 @@ AddScreen, ConfirmScreen {
     color: $foreground;
 }
 #add-box Input:focus { background: $primary 20%; }
+/* A Select is a compound widget: the value lives in an inner SelectCurrent. Setting
+   height on the outer one alone squeezes the inner out of view, so the field renders
+   blank however you set it. Both have to be collapsed together. */
 #add-box Select {
     height: 1;
     border: none;
     margin: 0;
     background: $panel;
 }
-#add-box Select:focus { background: $primary 20%; }
+#add-box Select SelectCurrent {
+    height: 1;
+    border: none;
+    padding: 0 1;
+    background: $panel;
+    color: $foreground;
+}
+#add-box Select:focus SelectCurrent { background: $primary 20%; }
+/* The dropdown itself is on the overlay layer, so it may be as tall as it likes. */
+#add-box Select SelectOverlay {
+    max-height: 12;
+    border: round $primary;
+    background: $surface;
+}
 #add-box Checkbox {
     height: 1;
     border: none;

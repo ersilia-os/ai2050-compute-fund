@@ -121,11 +121,28 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     exit 1
 fi
 cleanup() {
+    # Take the orchestrator down with us.
+    #
+    # It runs under `setsid` in its own process group so that `cancel` can kill the
+    # whole tree — but that also means it does NOT die when this driver is stopped.
+    # Leaving it behind is actively dangerous: it keeps submitting waves, and the
+    # next driver you start will run a SECOND model concurrently, both fighting for
+    # nodes and writing into /fsx.
+    if [ -n "${CHILD_PID:-}" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+        echo "[$(now_iso)] driver exiting — stopping the orchestrator it launched"
+        cancel_child "${CURRENT_LOG:-}"
+        if [ -n "${CURRENT_KEY:-}" ]; then
+            status_update "$CURRENT_KEY" cancelled "stopped because the driver exited"
+        fi
+    fi
     rmdir "$LOCK" 2>/dev/null
     rm -f "${STATE_FILE}.tmp.$$" "$(status_file).tmp.$$" 2>/dev/null
     rm -f "$(driver_info)" 2>/dev/null
 }
 trap cleanup EXIT
+# Without these, Ctrl-C and `kill` bypass the EXIT trap's cleanup in some shells.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---- state arrays (index-aligned, rebuilt on every queue re-read) ----
 Q_MODEL=(); Q_MODE=(); Q_LIB=(); Q_WAVE=(); Q_QUEUE=(); Q_KEY=(); Q_HOLD=()
@@ -348,12 +365,14 @@ ensure_sif() {  # $1=model $2=logfile ; 0 if present (or fetched), 1 otherwise
 # job the scheduler did not start.
 cancel_child() {  # $1 = logfile
     local logf="$1" aid
-    if [ -f "$logf" ]; then
-        for aid in $(grep -oP 'Submitted (array|batch) job \K[0-9]+' "$logf" 2>/dev/null | sort -u); do
-            log_line "  scancel ${aid}"
-            scancel "$aid" 2>/dev/null
-        done
-    fi
+
+    # ORDER MATTERS, and it is the opposite of the obvious one.
+    #
+    # Kill the orchestrator FIRST, scancel second. If the array is cancelled while
+    # the orchestrator still lives, it sees the job vanish from squeue, concludes the
+    # wave finished, runs its verify step, finds the whole wave missing from S3 — and
+    # fires its own "resubmit once" retry. You cancel a wave and a fresh one appears.
+    # A dead orchestrator cannot react to anything.
     if [ -n "${CHILD_PGID:-}" ]; then
         log_line "  terminating orchestrator process group ${CHILD_PGID}"
         kill -TERM -"$CHILD_PGID" 2>/dev/null
@@ -362,6 +381,15 @@ cancel_child() {  # $1 = logfile
             sleep 1; waited=$((waited + 1))
         done
         kill -0 "$CHILD_PID" 2>/dev/null && kill -KILL -"$CHILD_PGID" 2>/dev/null
+    fi
+
+    # Now that nothing can resubmit, drop whatever it left on the queue. Ids come
+    # from THIS job's log only, so we can never scancel something we did not start.
+    if [ -f "$logf" ]; then
+        for aid in $(grep -oP 'Submitted (array|batch) job \K[0-9]+' "$logf" 2>/dev/null | sort -u); do
+            log_line "  scancel ${aid}"
+            scancel "$aid" 2>/dev/null
+        done
     fi
 }
 
@@ -424,6 +452,9 @@ run_job() {  # $1 = index
     CHILD_PID=$!
     CHILD_PGID="$(ps -o pgid= -p "$CHILD_PID" 2>/dev/null | tr -d ' ')"
     : "${CHILD_PGID:=$CHILD_PID}"
+    # The EXIT trap has no access to $i, so publish what it needs to clean up.
+    CURRENT_LOG="${Q_LOG[i]}"
+    CURRENT_KEY="$key"
 
     while kill -0 "$CHILD_PID" 2>/dev/null; do
         drain_control
@@ -445,7 +476,7 @@ run_job() {  # $1 = index
 
     wait "$CHILD_PID" 2>/dev/null; rc=$?
     [ "$DRY_RUN" -eq 1 ] && [ "$cancelled" -eq 0 ] && rc="${FAKE_RC[i]:-0}"
-    CHILD_PID=""; CHILD_PGID=""
+    CHILD_PID=""; CHILD_PGID=""; CURRENT_LOG=""; CURRENT_KEY=""
 
     Q_FIN[i]="$(now_iso)"
     Q_DONE[i]="$(s3_count_output "$model" "$lib" "$mode")"
@@ -528,6 +559,24 @@ echo "=========================================="
 RC=0
 FAILS=0
 IDLE_ANNOUNCED=0
+
+# A SIGKILLed driver cannot run its trap, so an orchestrator can still be orphaned.
+# Starting a second model alongside it is the worst outcome, so say so loudly — the
+# operator can then kill it, or let it finish before resuming.
+warn_orphan_orchestrators() {
+    local pids
+    pids="$(pgrep -u "$(id -u)" -f 'submit-(ersilia|singularity)-waves\.sh' 2>/dev/null | tr '\n' ' ')"
+    [ -n "$pids" ] || return 0
+    echo "=========================================="
+    echo "WARNING: a wave orchestrator is ALREADY RUNNING (pid(s): ${pids})"
+    echo "  A previous driver was killed without cleaning up, or someone started one"
+    echo "  by hand. If you let this driver proceed, TWO models will run at once and"
+    echo "  fight over nodes and /fsx."
+    echo "  To stop the stray one:  kill ${pids}"
+    echo "  Then check for its SLURM jobs:  squeue -u \$USER"
+    echo "=========================================="
+}
+warn_orphan_orchestrators
 
 reclaim_stale_running
 

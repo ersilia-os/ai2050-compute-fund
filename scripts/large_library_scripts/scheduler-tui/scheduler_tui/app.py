@@ -97,6 +97,8 @@ class SchedulerTUI(App):
         #   "all"     done for every row (user-requested; seconds on a long queue)
         self._live_scope = "running"
         self._recounting = False
+        #: an S3 recount is in flight; cheap refreshes stand aside
+        self._live_in_flight = False
         #: last known live S3 counts, {job key: {done, total}}
         self._count_cache: dict = {}
         self.snapshot: Snapshot = Snapshot()
@@ -146,7 +148,7 @@ class SchedulerTUI(App):
         self.theme = self.start_theme
         self.query_one("#table", QueueTable).focus()
         self.refresh_snapshot()
-        self.set_interval(self.refresh_interval, self.refresh_snapshot)
+        self.set_interval(self.refresh_interval, self._tick)
         # Periodically ask for a real S3 recount, the way scheduler-status.sh does.
         # Totals cost one listing per library and `done` one for the running row, so
         # this stays bounded no matter how long the queue is.
@@ -156,11 +158,23 @@ class SchedulerTUI(App):
     # ------------------------------------------------------------------
     # data flow
     # ------------------------------------------------------------------
+    def _tick(self) -> None:
+        """The cheap periodic refresh.
+
+        Skipped while an S3 recount is in flight: the dump worker is `exclusive`, so
+        a 2-second tick would cancel the recount and discard its result — the very
+        numbers the user asked for, thrown away seconds before they arrive.
+        """
+        if self._live_in_flight:
+            return
+        self.refresh_snapshot()
+
     def _request_live(self, scope: str = "running") -> None:
         """Mark the next dump as needing an S3 recount, and fetch it now."""
         # "all" must not be downgraded by a periodic tick that lands first.
         if scope == "all" or self._live_scope != "all":
             self._live_scope = scope
+        self._live_in_flight = True
         self.refresh_snapshot()
 
     @work(thread=True, exclusive=True, group="dump")
@@ -190,10 +204,15 @@ class SchedulerTUI(App):
         return job.log if job and job.log else None
 
     def _on_transport_error(self, message: str) -> None:
+        self._live_in_flight = False
+        if self._recounting:
+            self._recounting = False
+            self.notify("Recount failed — see the banner.", severity="error", timeout=6)
         self.snapshot.error = message
         self._render_banner(f"Cannot reach the scheduler: {message}", error=True)
 
     def _on_snapshot(self, snapshot: Snapshot) -> None:
+        self._live_in_flight = False
         # Carry live S3 counts across the cheap refreshes that do not include them.
         if snapshot.counts_are_live:
             harvest_counts(snapshot, self._count_cache)

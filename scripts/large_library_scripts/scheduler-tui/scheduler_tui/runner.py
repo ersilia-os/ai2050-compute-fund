@@ -27,6 +27,12 @@ DEFAULT_REMOTE_CTL = "/shared/scripts/large_library_scripts/scheduler/sched-ctl.
 # connection surfaces as a "stale" banner rather than a frozen UI.
 DEFAULT_TIMEOUT = 25
 
+# S3 recounts are a different order of magnitude: one prefix listing per model, each
+# walking every object, plus ~1s of AWS CLI startup per call. A seven-model queue
+# over a 13,639-chunk library runs to minutes, not seconds.
+LIVE_TIMEOUT = 120        # totals per library + the running row
+LIVE_ALL_TIMEOUT = 600    # every row, on explicit request
+
 
 class RunnerError(RuntimeError):
     """A ctl invocation could not be carried out at all (transport failure)."""
@@ -61,7 +67,7 @@ class Runner:
         return flags
 
     # -- invocation -------------------------------------------------------
-    def run(self, *args: str) -> Tuple[int, str, str]:
+    def run(self, *args: str, timeout: Optional[int] = None) -> Tuple[int, str, str]:
         """Invoke ctl. Returns ``(returncode, stdout, stderr)``.
 
         A non-zero return code is a normal outcome (e.g. "no queue entry matches")
@@ -76,7 +82,7 @@ class Runner:
                 argv,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
+                timeout=timeout or self.timeout,
                 env=env,
             )
         except FileNotFoundError as exc:
@@ -93,15 +99,24 @@ class Runner:
         ``live`` asks ctl to recount progress from S3: ``"running"`` for per-library
         totals plus the running row, ``"all"`` for every row. Empty means trust the
         counts the driver recorded.
+
+        A recount needs a far bigger time budget than a plain dump: each prefix
+        listing walks every object (a 13,639-chunk library is ~14 paged API calls)
+        and the AWS CLI costs about a second just to start. At the plain-dump
+        timeout a full recount reports as "cannot reach the scheduler", which reads
+        as a broken connection rather than "this is slow".
         """
         args = ["dump"]
         if log_path:
             args += ["--log", log_path]
+        timeout = self.timeout
         if live == "running":
             args.append("--live")
+            timeout = max(timeout, LIVE_TIMEOUT)
         elif live == "all":
             args.append("--live-all")
-        rc, out, err = self.run(*args)
+            timeout = max(timeout, LIVE_ALL_TIMEOUT)
+        rc, out, err = self.run(*args, timeout=timeout)
         if rc != 0 and not out.strip():
             raise RunnerError(err.strip() or f"dump failed (rc={rc})")
         return out
