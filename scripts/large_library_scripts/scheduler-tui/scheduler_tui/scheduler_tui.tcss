@@ -231,11 +231,13 @@ AddScreen, ConfirmScreen {
     color: $primary;
     padding-bottom: 1;
 }
-/* No blank row between groups: five label+field pairs plus a title and buttons has
+/* No blank row between groups: six label+field pairs plus a title and buttons has
    to fit a 24-row terminal without scrolling, and the filled field backgrounds
    already separate one group from the next.
    Note margin, not padding — with height:1 a padding-top pushes the text out of its
-   own box and the label vanishes. */
+   own box and the label vanishes.
+   height:1 also means every .field-label must stay on ONE line at this dialog's
+   width — a label that wraps loses its second row with no visible sign. */
 #add-box .field-label, #confirm-box .field-label {
     color: $text-muted;
     height: 1;

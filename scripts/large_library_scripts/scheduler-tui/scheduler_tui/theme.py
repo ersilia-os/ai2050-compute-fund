@@ -1,6 +1,9 @@
-"""Palette and themes.
+"""Palette and themes — built from the official Ersilia colours.
 
-Design principle, and the reason the colours are arranged this way:
+Exactly two themes are registered: `ersilia-dark` and `ersilia-light`. `D` toggles
+between them and nothing else; Textual's built-ins are not offered.
+
+Design principle, unchanged, and the reason the colours are arranged this way:
 
     The running row is the only luminous thing on screen, and warmth always
     means attention.
@@ -8,17 +11,22 @@ Design principle, and the reason the colours are arranged this way:
 A wave-scheduler queue is mostly *waiting* — a 1.4B-molecule library takes days,
 so at any moment one row is working and the rest are idle or finished. A palette
 that gives every status an equally bright hue turns that into a wall of confetti
-and buries the one row you actually care about. So:
+and buries the one row you actually care about.
 
-  * the ground is a deep petrol-black, and structure is a desaturated sea-teal
-  * `running` is the single bright cool colour — the eye lands on it immediately
-  * everything settled (pending, done, skipped) is low-chroma and recedes
-  * warm hues are reserved for things needing a human: held, missing, failed,
-    cancelled, stale. Any warmth in the table means "look here"
+How the brand palette maps onto that:
 
-Both a dark and a light variant are defined, because a terminal's background is
-not ours to choose. The light variant is not the dark one lightened: each hue is
-re-picked for contrast against a pale ground.
+  * the PRIMARY palette is the page. Plum shades make the dark ground, White is
+    the text, Mint is the structural accent (headings, selection, focus). Plum
+    with Mint is the pairing Ersilia is recognised by.
+  * the SECONDARY palette carries the status semantics — which is what a secondary
+    palette is for. Blue is the one bright cool, so the live row is where the eye
+    lands. Mint means finished. Yellow / Orange / Pink mean a human is needed.
+
+Every value below is a literal brand colour except those marked SHADE or TINT,
+which are darkened or lightened versions of one. Two reasons those are
+unavoidable: the secondary palette is uniformly light (every channel 130+), so on
+a WHITE ground none of it reaches readable contrast; and there are nine statuses
+to tell apart using six secondary colours.
 """
 
 from __future__ import annotations
@@ -28,90 +36,111 @@ from typing import Dict, Tuple
 from textual.theme import Theme
 
 # ---------------------------------------------------------------------------
-# themes  (drive Textual's own widgets too: footer, toasts, modals, dropdowns)
+# The official Ersilia palette — the single source of truth for this file
+# ---------------------------------------------------------------------------
+# Primary
+PLUM = "#50285A"    # rgb(80,40,90)
+MINT = "#BEE6B4"    # rgb(190,230,180)
+WHITE = "#FFFFFF"   # rgb(255,255,255)
+# Secondary
+GRAY = "#D2D2D0"    # rgb(210,210,210)
+YELLOW = "#FAD782"  # rgb(250,215,130)
+BLUE = "#8CC8FA"    # rgb(140,200,250)
+PINK = "#DCA0DC"    # rgb(220,160,220)
+ORANGE = "#FAA08C"  # rgb(250,160,140)
+PURPLE = "#AA96FA"  # rgb(170,150,250)
+
+# ---------------------------------------------------------------------------
+# themes  (these also drive Textual's own widgets: footer, toasts, modals,
+# Select overlays — so the whole app sits in one palette)
 # ---------------------------------------------------------------------------
 
 ERSILIA_DARK = Theme(
     name="ersilia-dark",
     dark=True,
-    background="#0d1319",   # deep petrol black — calm, and not pure black
-    surface="#121a22",
-    panel="#18222c",
-    foreground="#cfd9e2",
-    primary="#5fb3a1",      # sea teal: structure, selection, headings
-    secondary="#56b6f0",    # instrument cyan: the live signal
-    success="#5f9e76",
-    warning="#c99542",
-    error="#d75f5f",
-    accent="#9d76ad",
+    background="#160F1B",   # SHADE of Plum — near-black, but still plum
+    surface="#1E1526",      # SHADE of Plum
+    panel="#2A1D33",        # SHADE of Plum
+    foreground="#F2ECF4",   # White, faintly plum-tinted so it settles on the ground
+    primary=MINT,           # structure: headings, selection, focus
+    secondary=BLUE,         # the live signal
+    success=MINT,
+    warning=YELLOW,
+    error=ORANGE,
+    accent=PURPLE,
     variables={
-        "block-cursor-background": "#1a3a35",
-        "block-cursor-foreground": "#eaf3f0",
+        "block-cursor-background": "#3A2846",   # SHADE of Plum: the selected row
+        "block-cursor-foreground": WHITE,
         "block-cursor-text-style": "bold",
-        "footer-key-foreground": "#5fb3a1",
-        "footer-description-foreground": "#7d8b9a",
+        "footer-key-foreground": MINT,
+        "footer-description-foreground": "#9A8FA0",
     },
 )
 
 ERSILIA_LIGHT = Theme(
     name="ersilia-light",
     dark=False,
-    background="#f4f7f8",
-    surface="#ffffff",
-    panel="#e7eef0",
-    foreground="#1d2730",
-    primary="#2f7d6d",
-    secondary="#1f6f9e",
-    success="#35774f",
-    warning="#8a5f14",
-    error="#a83232",
-    accent="#6c4a7c",
+    background="#FAF8FB",   # White, a hair off so panels can read against it
+    surface=WHITE,
+    panel="#F1EBF4",        # TINT of Plum
+    foreground="#2A1730",   # SHADE of Plum — body text
+    primary=PLUM,           # on white, Plum itself is the accent
+    secondary="#2F7FC4",    # SHADE of Blue (brand Blue is illegible on white)
+    success="#4E8C42",      # SHADE of Mint
+    warning="#A87A1E",      # SHADE of Yellow
+    error="#B03A28",        # SHADE of Orange
+    accent="#6A55C4",       # SHADE of Purple
     variables={
-        "block-cursor-background": "#cfe6df",
-        "block-cursor-foreground": "#12211d",
+        "block-cursor-background": "#E4D8EA",   # TINT of Plum
+        "block-cursor-foreground": "#2A1730",
         "block-cursor-text-style": "bold",
-        "footer-key-foreground": "#2f7d6d",
-        "footer-description-foreground": "#5c6b78",
+        "footer-key-foreground": PLUM,
+        "footer-description-foreground": "#6B5A72",
     },
 )
 
+#: The only two themes the app registers.
 THEMES = (ERSILIA_DARK, ERSILIA_LIGHT)
+DARK_THEME = ERSILIA_DARK.name
+LIGHT_THEME = ERSILIA_LIGHT.name
 
 # ---------------------------------------------------------------------------
 # status palette
 # ---------------------------------------------------------------------------
 # (colour, glyph). The glyph carries the meaning where colour cannot: a
 # monochrome terminal, a colour-blind reader, or a screenshot pasted into chat.
+#
+# Glyphs come from the geometric/dingbat ranges that monospace terminal fonts
+# reliably ship. Deliberately NO emoji: an emoji-presentation codepoint renders
+# double-width in some terminals and single in others, which silently shifts
+# every column after it out of line.
 
-# Glyphs are drawn from the geometric/dingbat ranges that monospace terminal fonts
-# reliably ship (DejaVu, Liberation, Menlo, Cascadia). Deliberately NO emoji: an
-# emoji-presentation codepoint like ⚠ or ⏸ renders double-width in some terminals
-# and single in others, which silently shifts every column after it out of line.
 _DARK_STATUS: Dict[str, Tuple[str, str]] = {
-    "running":       ("#56b6f0", "●"),   # the one bright cool — draws the eye
-    "pending":       ("#64737f", "○"),   # waiting is not news
-    "done":          ("#5f9e76", "✓"),   # muted: finished work should settle
-    "skipped":       ("#4c5762", "·"),
-    "held":          ("#a8823c", "‖"),   # warm from here down = wants a human
-    "missing-files": ("#c08a3e", "△"),
-    "cancelled":     ("#9d76ad", "⊘"),
-    "failed":        ("#d75f5f", "✕"),
-    "stale":         ("#d97742", "?"),
+    "running":       (BLUE,      "●"),   # the one bright cool — draws the eye
+    "pending":       ("#9A9A98", "○"),   # SHADE of Gray: waiting is not news
+    "done":          (MINT,      "✓"),   # finished
+    "skipped":       ("#5F5A66", "·"),   # SHADE of Gray: ignored entirely
+    "held":          (YELLOW,    "‖"),   # warm from here down = wants a human
+    "missing-files": (ORANGE,    "△"),
+    "cancelled":     (PINK,      "⊘"),
+    "failed":        ("#E8705A", "✕"),   # SHADE of Orange: the strongest alarm
+    "stale":         (PURPLE,    "?"),   # claims to be running, but no live driver
 }
 
 _LIGHT_STATUS: Dict[str, Tuple[str, str]] = {
-    "running":       ("#1f6f9e", "●"),
-    "pending":       ("#7a8895", "○"),
-    "done":          ("#35774f", "✓"),
-    "skipped":       ("#9aa5ae", "·"),
-    "held":          ("#8a6a1e", "‖"),
-    "missing-files": ("#8a5f14", "△"),
-    "cancelled":     ("#6c4a7c", "⊘"),
-    "failed":        ("#a83232", "✕"),
-    "stale":         ("#a4531f", "?"),
+    # All shades: the brand secondaries are far too light to read on white.
+    "running":       ("#2F7FC4", "●"),   # SHADE of Blue
+    "pending":       ("#77776F", "○"),   # SHADE of Gray
+    "done":          ("#4E8C42", "✓"),   # SHADE of Mint
+    "skipped":       ("#A5A5A0", "·"),   # SHADE of Gray
+    "held":          ("#A87A1E", "‖"),   # SHADE of Yellow
+    "missing-files": ("#C4643E", "△"),   # SHADE of Orange
+    "cancelled":     ("#A0559E", "⊘"),   # SHADE of Pink
+    "failed":        ("#B03A28", "✕"),   # deeper SHADE of Orange
+    "stale":         ("#6A55C4", "?"),   # SHADE of Purple
 }
 
-_FALLBACK = ("#7d8b9a", "·")
+_FALLBACK = ("#9A8FA0", "·")
 
 
 class Palette:
@@ -122,11 +151,11 @@ class Palette:
         self.status = _DARK_STATUS if dark else _LIGHT_STATUS
         # The bar track must be barely there: on a queue of 50 rows a bright track
         # becomes a texture that competes with the fills it exists to measure.
-        self.track = "#1e2a35" if dark else "#dbe3e7"
-        self.dim = "#5b6976" if dark else "#8996a2"
-        self.text = "#cfd9e2" if dark else "#1d2730"
-        self.bright = "#eaf3f0" if dark else "#0d1a16"
-        self.rule = "#26313d" if dark else "#ccd7dc"
+        self.track = "#33263C" if dark else "#E2DAE6"   # SHADE / TINT of Plum
+        self.dim = "#9A8FA0" if dark else "#7C6B84"
+        self.text = "#F2ECF4" if dark else "#2A1730"
+        self.bright = WHITE if dark else "#1A0E20"
+        self.rule = "#2A1D33" if dark else "#DDD2E2"
 
     def status_style(self, status: str) -> Tuple[str, str]:
         return self.status.get(status, _FALLBACK)

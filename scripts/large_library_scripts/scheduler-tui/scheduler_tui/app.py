@@ -31,7 +31,7 @@ from .model import (
     parse_dump,
 )
 from .runner import Runner, RunnerError
-from .theme import THEMES
+from .theme import DARK_THEME, LIGHT_THEME, THEMES
 from .widgets import ContextMenu, QueueTable, Splitter, StatChips, set_dark
 
 
@@ -84,7 +84,7 @@ class SchedulerTUI(App):
         runner: Runner,
         refresh_interval: float = 2.0,
         live_interval: float = 60.0,
-        start_theme: str = "ersilia-dark",
+        start_theme: str = DARK_THEME,
     ) -> None:
         super().__init__()
         self.runner = runner
@@ -195,12 +195,11 @@ class SchedulerTUI(App):
         tick is wasted bytes over SSH when nobody is looking at it."""
         if not self.show_log:
             return None
-        model = self._log_model or (
-            self.snapshot.running_job().model if self.snapshot.running_job() else None
-        )
-        if not model:
+        running = self.snapshot.running_job()
+        key = self._log_model or (running.key if running else None)
+        if not key:
             return None
-        job = self.snapshot.find(model)
+        job = self.snapshot.find_by_key(key)
         return job.log if job and job.log else None
 
     def _on_transport_error(self, message: str) -> None:
@@ -225,6 +224,17 @@ class SchedulerTUI(App):
                 f"Old driver (pid {snapshot.driver_pid or '?'}). Watching is safe and "
                 "the progress below is real. Queue edits will not apply until you "
                 "restart the driver on the current version."
+            )
+        elif not snapshot.driver_alive:
+            # Say which half of the UI still works, because "STOPPED" alone leaves
+            # you guessing whether an edit landed. Queue edits are written to the
+            # queue file and the driver re-reads it before every job, so staging a
+            # queue against a stopped driver is a real workflow — but run-control
+            # has nothing to act on and ctl will refuse it.
+            self._render_banner(
+                "No driver running. Queue edits (add, remove, reorder, hold, retry) "
+                "are saved and take effect when you start one. Run-control "
+                "(stop-after-current) is unavailable, and Cancel falls back to Hold."
             )
         else:
             self._render_banner(None)
@@ -293,19 +303,21 @@ class SchedulerTUI(App):
         if not self.show_log:
             return
         snap = self.snapshot
-        model = self._log_model
-        if model is None:
+        key = self._log_model
+        if key is None:
             running = snap.running_job()
-            model = running.model if running else None
+            key = running.key if running else None
+        job = snap.find_by_key(key) if key else None
+        model = job.model if job else None
         follow = "follow ✓" if self.follow_log else "follow ✗ (frozen)"
         title = f"log · {model or '(no job selected)'}    [{follow}]"
         self.query_one("#log-title", Static).update(title)
 
         # With follow off the view is frozen so you can actually read a wall of
         # orchestrator output without it being yanked to the bottom every tick.
-        if not self.follow_log and self._log_rendered == model:
+        if not self.follow_log and self._log_rendered == key:
             return
-        self._log_rendered = model
+        self._log_rendered = key
 
         view = self.query_one("#log-view", RichLog)
         view.clear()
@@ -341,10 +353,22 @@ class SchedulerTUI(App):
     # ------------------------------------------------------------------
     @property
     def selected(self) -> Optional[Job]:
-        model = self.query_one("#table", QueueTable).selected_model
-        if not model:
+        key = self.query_one("#table", QueueTable).selected_key
+        if not key:
             return None
-        return self.snapshot.find(model)
+        return self.snapshot.find_by_key(key)
+
+    def _sel(self, job: Job) -> str:
+        """An unambiguous ctl selector for this job.
+
+        ctl accepts a model id or a 1-based position. A model id is stable across
+        reordering and so is normally the better choice — but the same model may be
+        queued against several libraries, and ctl then acts on the FIRST match. In
+        that case only the position identifies the row the user is looking at.
+        """
+        if self.snapshot.model_count(job.model) > 1:
+            return str(job.pos)
+        return job.model
 
     def _need_selection(self) -> Optional[Job]:
         job = self.selected
@@ -374,12 +398,17 @@ class SchedulerTUI(App):
                 args.append(wave)
             if queue:
                 args.append(queue)
+            # --cpus is a named option, so unlike the positionals it needs no
+            # placeholder padding and can be omitted independently.
+            if result.get("cpus"):
+                args += ["--cpus", result["cpus"]]
             if result["top"]:
                 args.append("--top")
             self.run_ctl(*args)
 
         self.push_screen(
-            AddScreen(snap.libraries, snap.default_library), on_close
+            AddScreen(snap.libraries, snap.default_library, snap.max_cpus_per_task),
+            on_close,
         )
 
     def action_remove(self) -> None:
@@ -389,7 +418,7 @@ class SchedulerTUI(App):
 
         def on_close(confirmed: bool) -> None:
             if confirmed:
-                self.run_ctl("rm", job.model)
+                self.run_ctl("rm", self._sel(job))
 
         self.push_screen(
             ConfirmScreen(
@@ -405,27 +434,27 @@ class SchedulerTUI(App):
     def action_top(self) -> None:
         job = self._need_selection()
         if job:
-            self.run_ctl("top", job.model)
+            self.run_ctl("top", self._sel(job))
 
     def action_move_up(self) -> None:
         job = self._need_selection()
         if job:
-            self.run_ctl("up", job.model)
+            self.run_ctl("up", self._sel(job))
 
     def action_move_down(self) -> None:
         job = self._need_selection()
         if job:
-            self.run_ctl("down", job.model)
+            self.run_ctl("down", self._sel(job))
 
     def action_hold(self) -> None:
         job = self._need_selection()
         if job:
-            self.run_ctl("unhold" if job.hold else "hold", job.model)
+            self.run_ctl("unhold" if job.hold else "hold", self._sel(job))
 
     def action_retry(self) -> None:
         job = self._need_selection()
         if job:
-            self.run_ctl("retry", job.model)
+            self.run_ctl("retry", self._sel(job))
 
     def action_cancel(self) -> None:
         job = self._need_selection()
@@ -449,7 +478,7 @@ class SchedulerTUI(App):
 
         def on_close(confirmed: bool) -> None:
             if confirmed:
-                self.run_ctl("cancel", job.model)
+                self.run_ctl("cancel", self._sel(job))
 
         self.push_screen(ConfirmScreen(title, detail, ok_label="Do it"), on_close)
 
@@ -457,6 +486,18 @@ class SchedulerTUI(App):
         self.run_ctl("resume" if self.snapshot.paused else "pause")
 
     def action_stop_after(self) -> None:
+        # There is no "current" to stop after. The flag would sit in the control dir
+        # and arm the NEXT driver to quit after its first model — a delayed surprise
+        # rather than a no-op, which is why the driver discards it at startup and ctl
+        # refuses it. Fail here too so the key does not open a dialog that cannot work.
+        if not self.snapshot.driver_alive:
+            self.notify(
+                "No driver running — nothing to stop after. Start one first.",
+                severity="warning",
+                timeout=5,
+            )
+            return
+
         def on_close(confirmed: bool) -> None:
             if confirmed:
                 self.run_ctl("stop-after-current")
@@ -490,7 +531,7 @@ class SchedulerTUI(App):
     def action_toggle_log(self) -> None:
         job = self.selected
         if job:
-            self._log_model = job.model
+            self._log_model = job.key
         self.show_log = not self.show_log
 
     def action_toggle_follow(self) -> None:
@@ -513,9 +554,9 @@ class SchedulerTUI(App):
             self._render_chips()
 
     def action_toggle_dark_theme(self) -> None:
-        self.theme = (
-            "ersilia-light" if self.theme == "ersilia-dark" else "ersilia-dark"
-        )
+        # Only the two Ersilia themes are in play; this toggles strictly between
+        # them rather than cycling Textual's built-ins.
+        self.theme = LIGHT_THEME if self.theme == DARK_THEME else DARK_THEME
 
     def watch_show_log(self, show: bool) -> None:
         if not self.is_mounted:
@@ -535,14 +576,14 @@ class SchedulerTUI(App):
 
     @on(QueueTable.OpenLog)
     def _on_open_log(self, event: QueueTable.OpenLog) -> None:
-        self._log_model = event.model
+        self._log_model = event.key
         self.show_log = True
         self.refresh_snapshot()
 
     @on(QueueTable.ContextRequested)
     def _on_context(self, event: QueueTable.ContextRequested) -> None:
         self._close_menu()
-        menu = ContextMenu(event.model)
+        menu = ContextMenu(event.key)
         self._menu = menu
         self.mount(menu)
         menu.styles.offset = (event.x, min(event.y, max(0, self.size.height - 10)))
@@ -550,17 +591,17 @@ class SchedulerTUI(App):
     @on(ContextMenu.Chosen)
     def _on_context_chosen(self, event: ContextMenu.Chosen) -> None:
         self._close_menu()
-        job = self.snapshot.find(event.model)
+        job = self.snapshot.find_by_key(event.key)
         if job is None:
             return
         verb = event.verb
         if verb == "log":
-            self._log_model = job.model
+            self._log_model = job.key
             self.show_log = True
             self.refresh_snapshot()
             return
         if verb == "hold":
-            self.run_ctl("unhold" if job.hold else "hold", job.model)
+            self.run_ctl("unhold" if job.hold else "hold", self._sel(job))
             return
         if verb == "cancel":
             self.action_cancel()
@@ -568,7 +609,7 @@ class SchedulerTUI(App):
         if verb == "rm":
             self.action_remove()
             return
-        self.run_ctl(verb, job.model)
+        self.run_ctl(verb, self._sel(job))
 
     def _close_menu(self) -> None:
         if self._menu is not None:

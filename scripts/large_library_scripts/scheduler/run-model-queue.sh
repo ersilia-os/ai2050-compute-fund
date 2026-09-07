@@ -145,7 +145,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # ---- state arrays (index-aligned, rebuilt on every queue re-read) ----
-Q_MODEL=(); Q_MODE=(); Q_LIB=(); Q_WAVE=(); Q_QUEUE=(); Q_KEY=(); Q_HOLD=()
+Q_MODEL=(); Q_MODE=(); Q_LIB=(); Q_WAVE=(); Q_QUEUE=(); Q_KEY=(); Q_HOLD=(); Q_CPUS=()
 Q_STATUS=(); Q_DONE=(); Q_TOTAL=(); Q_START=(); Q_FIN=(); Q_LOG=(); Q_NOTE=()
 
 # ---- control state ----
@@ -155,14 +155,22 @@ SHUTDOWN=0              # exit as soon as the current job settles
 
 log_line() { echo "[$(now_iso)] $*"; }
 
+# Our own process group, captured once. cancel_child refuses to signal it.
+SELF_PGID="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+: "${SELF_PGID:=$$}"
+
 # =============================================================================
 # Queue parsing (re-run before every job)
 # =============================================================================
 
-add_job() {  # model mode library wave queue hold status note
+add_job() {  # model mode library wave queue hold status note [cpus]
     local i=${#Q_MODEL[@]}
     Q_MODEL[i]="$1"; Q_MODE[i]="$2"; Q_LIB[i]="$3"; Q_WAVE[i]="$4"; Q_QUEUE[i]="$5"
     Q_HOLD[i]="$6"; Q_STATUS[i]="$7"; Q_NOTE[i]="$8"
+    # Empty means "no override": the worker's own #SBATCH --cpus-per-task stands.
+    # That default differs per mode (ersilia 10, singularity 4) and the deployed
+    # copies have been re-tuned by hand, so the driver must not invent a number.
+    Q_CPUS[i]="${9:-}"
     Q_KEY[i]="$(job_key "$1" "$2" "$3")"
     Q_DONE[i]=0; Q_TOTAL[i]=0; Q_START[i]="-"; Q_FIN[i]="-"
     # Log name is derived from the job identity, not its queue position, so it is
@@ -171,36 +179,45 @@ add_job() {  # model mode library wave queue hold status note
 }
 
 _parse_queue_unlocked() {
-    Q_MODEL=(); Q_MODE=(); Q_LIB=(); Q_WAVE=(); Q_QUEUE=(); Q_KEY=(); Q_HOLD=()
+    Q_MODEL=(); Q_MODE=(); Q_LIB=(); Q_WAVE=(); Q_QUEUE=(); Q_KEY=(); Q_HOLD=(); Q_CPUS=()
     Q_STATUS=(); Q_DONE=(); Q_TOTAL=(); Q_START=(); Q_FIN=(); Q_LOG=(); Q_NOTE=()
-    local raw lib wave queue
+    local raw lib wave queue cpus
     while IFS= read -r raw || [ -n "$raw" ]; do
         parse_queue_line "$raw" || continue
 
         lib="${QL_LIB:-$DEFAULT_LIBRARY}"
         wave="${QL_WAVE:-$DEFAULT_WAVE_SIZE}"
         queue="${QL_QUEUE:-$DEFAULT_QUEUE}"
+        cpus="$QL_CPUS"
 
         if [ "$QL_MODE" != "ersilia" ] && [ "$QL_MODE" != "singularity" ]; then
             add_job "$QL_MODEL" "${QL_MODE:-?}" "${lib:-NA}" "$wave" "$queue" 0 \
-                    skipped "unknown mode '${QL_MODE:-}' (want ersilia|singularity)"
+                    skipped "unknown mode '${QL_MODE:-}' (want ersilia|singularity)" "$cpus"
             continue
         fi
         if [ -z "$lib" ]; then
             add_job "$QL_MODEL" "$QL_MODE" "NA" "$wave" "$queue" 0 \
-                    skipped "no library and no default_library given"
+                    skipped "no library and no default_library given" "$cpus"
             continue
         fi
         lib="$(resolve_library "$lib")"
         if ! [[ "$wave" =~ ^[0-9]+$ ]] || [ "$wave" -lt 1 ] || [ "$wave" -gt 1000 ]; then
             add_job "$QL_MODEL" "$QL_MODE" "$lib" "$wave" "$queue" 0 \
-                    skipped "wave_size '$wave' out of 1..1000"
+                    skipped "wave_size '$wave' out of 1..1000" "$cpus"
+            continue
+        fi
+        # A bad cpus= must not reach sbatch. Rejected here it costs one skipped row;
+        # passed through it would be an --cpus-per-task the controller refuses, once
+        # per array task, for every wave of the run.
+        if [ -n "$cpus" ] && ! is_valid_cpus "$cpus"; then
+            add_job "$QL_MODEL" "$QL_MODE" "$lib" "$wave" "$queue" 0 \
+                    skipped "cpus '$cpus' out of 1..${MAX_CPUS_PER_TASK}" "$cpus"
             continue
         fi
         if [ "$QL_HOLD" = "1" ]; then
-            add_job "$QL_MODEL" "$QL_MODE" "$lib" "$wave" "$queue" 1 held "held in queue file"
+            add_job "$QL_MODEL" "$QL_MODE" "$lib" "$wave" "$queue" 1 held "held in queue file" "$cpus"
         else
-            add_job "$QL_MODEL" "$QL_MODE" "$lib" "$wave" "$queue" 0 pending ""
+            add_job "$QL_MODEL" "$QL_MODE" "$lib" "$wave" "$queue" 0 pending "" "$cpus"
         fi
     done < "$QUEUE_FILE"
 }
@@ -319,6 +336,41 @@ drain_control() {
     done
 }
 
+# Drop control messages that were posted BEFORE this driver started.
+#
+# drain_control runs on the first tick of the main loop, so anything already sitting
+# in the control dir gets consumed by US — even though it was aimed at a driver that
+# is long gone. Every one of those is worse than a no-op:
+#   * a stale `shutdown` makes a freshly started driver exit immediately
+#   * a stale `cancel` kills the named model the moment the queue reaches it
+#   * a stale `stop-after-current` makes this driver run exactly one job and quit
+# The click that caused it may be hours old, so the symptom reads as "the scheduler
+# is broken" rather than as a consequence. sched-ctl.sh refuses these verbs when no
+# driver is alive; this is the other half of the guard, because ctl is a CLI and
+# anything could have written here.
+#
+# The `paused` flag is deliberately NOT cleared: pausing before starting the driver
+# is a legitimate way to bring it up idle while you stage the queue, and the state is
+# plainly visible in the header and in `sched-ctl.sh list`.
+discard_stale_control() {
+    local d f n=0
+    d="$(control_dir)"
+    [ -d "$d" ] || return 0
+    for f in "$d"/*.cancel "$d"/*.shutdown "$d"/*.refresh; do
+        [ -f "$f" ] || continue
+        log_line "discarding stale control message posted before startup: ${f##*/}"
+        rm -f "$f"
+        n=$((n + 1))
+    done
+    if [ -f "$(stopafter_flag)" ]; then
+        log_line "discarding stale stop-after-current flag posted before startup"
+        rm -f "$(stopafter_flag)"
+        n=$((n + 1))
+    fi
+    [ "$n" -gt 0 ] && log_line "discarded ${n} stale control message(s) — they predate this driver"
+    return 0
+}
+
 is_paused() { [ -f "$(paused_flag)" ]; }
 
 # Does a cancel request name this job? Matches the full key or just the model id,
@@ -363,6 +415,24 @@ ensure_sif() {  # $1=model $2=logfile ; 0 if present (or fetched), 1 otherwise
 # Cancel the orchestrator we launched, plus whatever it has in flight on SLURM.
 # Array job ids are scraped from THIS JOB'S LOG ONLY, so we can never scancel a
 # job the scheduler did not start.
+# Is this process group safe to signal — i.e. definitely NOT ours?
+#
+# A group-kill is the only way to take down an orchestrator and its subshells, but
+# it is also the only thing in this script that can kill the driver itself. If the
+# child ever ends up in our group (setsid unavailable, a pgid lookup that returned
+# something unexpected, the CHILD_PGID:=CHILD_PID fallback landing on our own group)
+# then `kill -KILL -$CHILD_PGID` SIGKILLs this driver, its tmux pane and the tmux
+# server, untrappably — no cleanup, stale lock, orchestrator left running. That is
+# exactly the outage seen on 2026-09-04, so the group is now checked before use.
+group_is_safe() {  # $1 = candidate pgid
+    local pgid="$1"
+    [ -n "$pgid" ] || return 1
+    [ "$pgid" -gt 1 ] 2>/dev/null || return 1
+    [ "$pgid" != "$SELF_PGID" ] || return 1
+    [ "$pgid" != "$$" ] || return 1
+    return 0
+}
+
 cancel_child() {  # $1 = logfile
     local logf="$1" aid
 
@@ -373,14 +443,27 @@ cancel_child() {  # $1 = logfile
     # wave finished, runs its verify step, finds the whole wave missing from S3 — and
     # fires its own "resubmit once" retry. You cancel a wave and a fresh one appears.
     # A dead orchestrator cannot react to anything.
-    if [ -n "${CHILD_PGID:-}" ]; then
-        log_line "  terminating orchestrator process group ${CHILD_PGID}"
+    local waited=0
+    if group_is_safe "${CHILD_PGID:-}"; then
+        log_line "  terminating orchestrator process group ${CHILD_PGID} (driver pgid ${SELF_PGID})"
         kill -TERM -"$CHILD_PGID" 2>/dev/null
-        local waited=0
         while kill -0 "$CHILD_PID" 2>/dev/null && [ "$waited" -lt 10 ]; do
             sleep 1; waited=$((waited + 1))
         done
         kill -0 "$CHILD_PID" 2>/dev/null && kill -KILL -"$CHILD_PGID" 2>/dev/null
+    elif [ -n "${CHILD_PID:-}" ]; then
+        # Refuse the group-kill and signal only the child. Its subshells may outlive
+        # it — warn, because that is a leak the operator has to finish by hand — but
+        # never take the driver down to avoid it.
+        log_line "  WARNING: orchestrator pgid '${CHILD_PGID:-<unknown>}' is not a separate"
+        log_line "           process group (driver pgid ${SELF_PGID}). Signalling pid"
+        log_line "           ${CHILD_PID} only, to avoid killing this driver."
+        log_line "           Check for leftovers:  pgrep -af 'submit-(ersilia|singularity)-waves'"
+        kill -TERM "$CHILD_PID" 2>/dev/null
+        while kill -0 "$CHILD_PID" 2>/dev/null && [ "$waited" -lt 10 ]; do
+            sleep 1; waited=$((waited + 1))
+        done
+        kill -0 "$CHILD_PID" 2>/dev/null && kill -KILL "$CHILD_PID" 2>/dev/null
     fi
 
     # Now that nothing can resubmit, drop whatever it left on the queue. Ids come
@@ -399,9 +482,10 @@ run_job() {  # $1 = index
     local i="$1"
     local model="${Q_MODEL[i]}" mode="${Q_MODE[i]}" lib="${Q_LIB[i]}"
     local wave="${Q_WAVE[i]}" queue="${Q_QUEUE[i]}" key="${Q_KEY[i]}"
+    local cpus="${Q_CPUS[i]:-}"
     local script rc cancelled=0 last_refresh=0 nowsec
 
-    log_line "----- ${model} (${mode}) on ${lib}  [queue pos $((i + 1))/${#Q_MODEL[@]}] -----"
+    log_line "----- ${model} (${mode}) on ${lib}  [queue pos $((i + 1))/${#Q_MODEL[@]}]${cpus:+  cpus=${cpus}} -----"
 
     # resume fast-skip: already complete in S3?
     Q_TOTAL[i]="$(s3_count_input "$lib")"
@@ -440,13 +524,18 @@ run_job() {  # $1 = index
     # Launch in its own process group (setsid) so a cancel can take down the whole
     # tree, and in the background so this driver keeps servicing control requests.
     # Output goes to the per-job log; `tee` would break pid/pgid tracking.
+    # cpus travels as an ENV var, not a 5th positional. The orchestrators take
+    # positionals in a fixed order and an older deployed copy would read a 5th one as
+    # nothing at all; an env var it does not know about is simply ignored, so a
+    # partially-synced /shared degrades to "no override" instead of to a wrong
+    # partition. Empty means "pass nothing", leaving the worker's #SBATCH in charge.
     if [ "$DRY_RUN" -eq 1 ]; then
-        log_line "  [dry-run] S3_BUCKET=$S3_BUCKET POLL_SECONDS=$POLL_SECONDS $script $model $lib $wave $queue"
+        log_line "  [dry-run] S3_BUCKET=$S3_BUCKET POLL_SECONDS=$POLL_SECONDS ${cpus:+CPUS_PER_TASK=$cpus }$script $model $lib $wave $queue"
         # A real sleeping child, so the poll/cancel path is genuinely exercised.
         setsid sleep "${SCHED_FAKE_DURATION:-30}" >>"${Q_LOG[i]}" 2>&1 &
     else
-        log_line "  dispatch: $script $model $lib $wave $queue  (log: ${Q_LOG[i]})"
-        S3_BUCKET="$S3_BUCKET" POLL_SECONDS="$POLL_SECONDS" \
+        log_line "  dispatch: ${cpus:+CPUS_PER_TASK=$cpus }$script $model $lib $wave $queue  (log: ${Q_LOG[i]})"
+        S3_BUCKET="$S3_BUCKET" POLL_SECONDS="$POLL_SECONDS" CPUS_PER_TASK="$cpus" \
             setsid "$script" "$model" "$lib" "$wave" "$queue" >>"${Q_LOG[i]}" 2>&1 &
     fi
     CHILD_PID=$!
@@ -455,6 +544,7 @@ run_job() {  # $1 = index
     # The EXIT trap has no access to $i, so publish what it needs to clean up.
     CURRENT_LOG="${Q_LOG[i]}"
     CURRENT_KEY="$key"
+    log_line "  orchestrator pid=${CHILD_PID} pgid=${CHILD_PGID:-<unknown>} (driver pgid=${SELF_PGID})"
 
     while kill -0 "$CHILD_PID" 2>/dev/null; do
         drain_control
@@ -578,6 +668,10 @@ warn_orphan_orchestrators() {
 }
 warn_orphan_orchestrators
 
+# Startup reconciliation, in this order: throw away messages meant for the dead
+# driver, THEN adopt the jobs it left behind. Reversed, a stale `cancel` naming a
+# just-reclaimed job would cancel it on the first tick.
+discard_stale_control
 reclaim_stale_running
 
 while :; do

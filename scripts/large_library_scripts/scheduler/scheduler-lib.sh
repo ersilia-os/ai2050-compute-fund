@@ -106,6 +106,44 @@ s3_count_output() {  # $1 = model  $2 = library  $3 = mode
         | grep -cP "$pat" || true
 }
 
+# List the libraries that actually exist in S3, i.e. the prefixes under input/.
+#
+# This is the authoritative answer to "what can I run against?" — the alias table
+# only knows the five hand-registered names, so anything ingested since (the h3d
+# selections, the 44g subsets, the 1.4B) was invisible to the add dialog.
+#
+# Cheap: `aws s3 ls` on a prefix with a trailing slash returns COMMON PREFIXES
+# (`PRE name/`), a dozen or so lines, not the millions of objects beneath them.
+# Cached anyway (default 1 h, SCHED_LIB_CACHE_TTL=0 to force) because the plain
+# dump the TUI polls every 2 s must never call AWS.
+s3_list_libraries() {  # $1 = any non-empty value forces a refresh
+    local force="${1:-}" cache="${LOG_DIR:-/tmp}/.libraries"
+    local ttl="${SCHED_LIB_CACHE_TTL:-3600}" age=999999 tmp
+
+    if [ "$SCHED_FAKE_S3" = "1" ]; then
+        awk '$1 == "input" { print $2 }' "$SCHED_FAKE_S3_FILE" 2>/dev/null | sort -u
+        return 0
+    fi
+
+    if [ -f "$cache" ]; then
+        age=$(( $(date -u +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+    fi
+    if [ -n "$force" ] || [ ! -f "$cache" ] || [ "$age" -ge "$ttl" ]; then
+        tmp="${cache}.tmp.$$"
+        # Only replace the cache with a non-empty result: a transient AWS failure
+        # must not blank the dropdown for the next hour.
+        if aws s3 ls "s3://${S3_BUCKET}/input/" 2>/dev/null \
+             | awk '$1 == "PRE" { sub(/\/$/, "", $2); print $2 }' \
+             | sort -u > "$tmp" && [ -s "$tmp" ]; then
+            mv -f "$tmp" "$cache" 2>/dev/null
+        else
+            rm -f "$tmp" 2>/dev/null
+        fi
+    fi
+    [ -f "$cache" ] && cat "$cache"
+    return 0
+}
+
 # Map a run mode to its wave-orchestrator script basename.
 mode_script() {  # $1 = mode
     case "$1" in
@@ -195,17 +233,51 @@ is_queue_flag() {  # $1 = token
     esac
 }
 
+# Upper bound for a per-job cpus-per-task override. The cpu-queue instance types
+# are 32-vCPU, so 32 means "one task per node" — the least dense, most memory-safe
+# packing available. Anything higher would make every task unschedulable.
+MAX_CPUS_PER_TASK="${MAX_CPUS_PER_TASK:-32}"
+
+# Value of a `key=value` queue flag, or empty with rc=1 when absent.
+# One implementation, because the driver reads these to build an sbatch line and
+# ctl reads them to render the same job — a disagreement would mean the dashboard
+# shows a packing the cluster is not using.
+queue_flag_value() {  # $1 = flags string, $2 = key
+    local tok
+    for tok in $1; do
+        case "$tok" in
+            "$2"=*) printf '%s' "${tok#*=}"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Is this a usable cpus-per-task override?
+#
+# Validated in two places on purpose: ctl rejects bad input at write time, and the
+# driver re-checks at read time because the queue file is hand-editable and a bad
+# value must degrade to a `skipped` verdict rather than an sbatch that fails 1000
+# times in an array.
+is_valid_cpus() {  # $1 = candidate
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le "$MAX_CPUS_PER_TASK" ]
+}
+
 # Parse one queue line into the QL_* globals. Returns 1 for blank/comment lines.
 #   <model_id> <mode> [library] [wave_size] [queue] [flags...]
 # Flags may appear anywhere after the model id; non-flag tokens fill the
 # positional fields in order. Unknown flags are preserved verbatim in QL_FLAGS so
 # a rewrite never silently drops one.
-# Globals set: QL_MODEL QL_MODE QL_LIB QL_WAVE QL_QUEUE QL_FLAGS QL_HOLD
+#
+# `cpus=N` is lifted into QL_CPUS *and* left in QL_FLAGS, exactly like `hold` is
+# lifted into QL_HOLD: the flags string is what gets written back, so removing the
+# token here would silently drop the override on the next rewrite.
+# Globals set: QL_MODEL QL_MODE QL_LIB QL_WAVE QL_QUEUE QL_FLAGS QL_HOLD QL_CPUS
 parse_queue_line() {  # $1 = raw line
     local raw="$1" trimmed tok
     trimmed="${raw#"${raw%%[![:space:]]*}"}"            # left-trim whitespace
     case "$trimmed" in ''|'#'*) return 1 ;; esac        # blank / comment
     QL_MODEL=""; QL_MODE=""; QL_LIB=""; QL_WAVE=""; QL_QUEUE=""; QL_FLAGS=""; QL_HOLD=0
+    QL_CPUS=""
 
     local -a positional=() flags=()
     for tok in $trimmed; do
@@ -227,6 +299,7 @@ parse_queue_line() {  # $1 = raw line
     for tok in ${QL_FLAGS}; do
         case "$tok" in hold|hold=1|hold=true) QL_HOLD=1 ;; esac
     done
+    QL_CPUS="$(queue_flag_value "$QL_FLAGS" cpus)" || QL_CPUS=""
     return 0
 }
 

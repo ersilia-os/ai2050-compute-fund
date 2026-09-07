@@ -128,15 +128,20 @@ class QueueTable(DataTable):
     # Uppercase headers: in a table with no rules, case change is what separates
     # the header band from the data without spending another colour on it.
     COLUMNS = ("#", "MODEL", "MODE", "LIBRARY", "STATUS", "CHUNKS DONE", "PROGRESS")
+    #: Shown only while some job carries a `cpus=N` override — see _columns_for().
+    #: A permanent column would spend width on a field that is usually blank, and
+    #: this table has already been bitten once by a clipped PROGRESS bar.
+    CPUS_COLUMN = "CPUS"
+    CPUS_WIDTH = 5
 
     class OpenLog(Message):
-        def __init__(self, model: str) -> None:
-            self.model = model
+        def __init__(self, key: str) -> None:
+            self.key = key
             super().__init__()
 
     class ContextRequested(Message):
-        def __init__(self, model: str, x: int, y: int) -> None:
-            self.model = model
+        def __init__(self, key: str, x: int, y: int) -> None:
+            self.key = key
             self.x = x
             self.y = y
             super().__init__()
@@ -148,13 +153,18 @@ class QueueTable(DataTable):
         # status colours, and the row cursor already shows where you are.
         self.zebra_stripes = False
         self._models: List[str] = []
+        self._keys: List[str] = []
         self._jobs: List[Job] = []
         self._bar_width = BAR_WIDTH
         self._library_width = LIBRARY_WIDTH
+        self._show_cpus = False
 
     #: Minimum width for each column, in order. LIBRARY absorbs slack because it is
     #: the only column whose content is genuinely variable-length.
-    MIN_WIDTHS = (3, 17, 11, 18, 13, 15, 12)
+    #: STATUS must fit the longest label plus the held marker — "△ missing-files  ‖"
+    #: is 18 cells, and a clipped status ("missing-fil") is exactly the kind of thing
+    #: someone misreads at a glance.
+    MIN_WIDTHS = (3, 17, 11, 18, 18, 15, 12)
     #: Per-cell horizontal padding DataTable adds on each side.
     CELL_PAD = 2
 
@@ -168,38 +178,70 @@ class QueueTable(DataTable):
         if self._jobs:
             self.render_jobs(self._jobs)
 
-    def _build_columns(self, available: int) -> None:
+    def _columns_for(self, show_cpus: bool):
+        """Labels + minimum widths for the current shape, CPUS folded in or not.
+
+        Returned together, and the slack maths below indexes them BY NAME, because
+        the optional column shifts every position after MODE.
+        """
+        labels = list(self.COLUMNS)
         widths = list(self.MIN_WIDTHS)
+        if show_cpus:
+            at = labels.index("MODE") + 1
+            labels.insert(at, self.CPUS_COLUMN)
+            widths.insert(at, self.CPUS_WIDTH)
+        return labels, widths
+
+    def _build_columns(self, available: int) -> None:
+        labels, widths = self._columns_for(self._show_cpus)
+        library_at = labels.index("LIBRARY")
+        progress_at = labels.index("PROGRESS")
         fixed = sum(widths) + self.CELL_PAD * len(widths)
         slack = available - fixed - 2  # -2 for the vertical scrollbar gutter
         if slack > 0:
             # Give the library column up to its comfortable width first, then hand
             # anything still spare to the progress bar.
-            grow_library = min(slack, LIBRARY_WIDTH - widths[3])
-            widths[3] += max(0, grow_library)
+            grow_library = min(slack, LIBRARY_WIDTH - widths[library_at])
+            widths[library_at] += max(0, grow_library)
             slack -= max(0, grow_library)
-            widths[6] += min(slack, BAR_WIDTH + 6 - widths[6])
-        self._bar_width = max(6, widths[6] - 6)  # leave room for " 100%"
+            widths[progress_at] += min(slack, BAR_WIDTH + 6 - widths[progress_at])
+        self._bar_width = max(6, widths[progress_at] - 6)  # leave room for " 100%"
         self.clear(columns=True)
-        for label, width in zip(self.COLUMNS, widths):
+        for label, width in zip(labels, widths):
             self.add_column(label, width=width, key=label)
-        self._library_width = widths[3] - 1
+        self._library_width = widths[library_at] - 1
 
     # -- data ------------------------------------------------------------
     def render_jobs(self, jobs: List[Job]) -> None:
-        """Replace the table's contents, keeping the cursor on the same MODEL.
+        """Replace the table's contents, keeping the cursor on the same JOB.
 
-        Anchoring on the model (not the row index) means a refresh that arrives
-        just as the queue is reordered does not silently move your selection onto
-        a different job — which matters a lot when the next keystroke is `cancel`.
+        Rows are keyed by `model|mode|library`, not by model id: the same model
+        against two libraries is a legitimate queue (eos21dr_v4 on Liquid_Stock and
+        on Molport), and keying by model made DataTable raise DuplicateKey and the
+        app crash outright.
+
+        Anchoring the cursor on that key (not the row index) means a refresh that
+        lands just as the queue is reordered does not silently move your selection
+        onto a different job — which matters a lot when the next keystroke is
+        `cancel`.
         """
         pal = _pal()
-        previous = self.selected_model
+        previous = self.selected_key
         self._jobs = jobs
+        # The CPUS column appears and disappears with the data, so the column set has
+        # to be rebuilt when that changes — add_row would otherwise supply a cell
+        # count the table has no column for. Read the selection FIRST: rebuilding
+        # clears the rows the cursor is anchored to.
+        show_cpus = any(job.cpus for job in jobs)
+        if show_cpus != self._show_cpus:
+            self._show_cpus = show_cpus
+            self._build_columns(self.size.width or 120)
         self.clear()
         self._models = []
+        self._keys = []
         for job in jobs:
             self._models.append(job.model)
+            self._keys.append(job.key)
             library = job.library or "<no default>"
             if job.library_is_default and job.library:
                 library = f"{job.library} *"
@@ -208,34 +250,54 @@ class QueueTable(DataTable):
             model_style = pal.bright if job.is_running else pal.text
             if job.is_running:
                 model_style = f"bold {model_style}"
-            self.add_row(
+            cells = [
                 Text(f"{job.pos:>2}", style=pal.dim),
                 Text(elide(job.model, 20), style=model_style),
                 Text(job.mode or "?", style=pal.dim),
+            ]
+            if self._show_cpus:
+                # An override is a deliberate act, so it reads at normal weight while
+                # the inherited default recedes — same hierarchy as the other columns.
+                cells.append(
+                    Text(job.cpus, style=pal.text) if job.cpus
+                    else Text("-", style=pal.dim)
+                )
+            cells += [
                 Text(elide(library, self._library_width), style=pal.text),
                 status_text(job.status, job.hold),
                 counts_text(job.done, job.total),
                 progress_bar(job.done, job.total, job.status, self._bar_width),
-                key=job.model,
-            )
-        if previous and previous in self._models:
-            self.move_cursor(row=self._models.index(previous))
+            ]
+            self.add_row(*cells, key=job.key)
+        if previous and previous in self._keys:
+            self.move_cursor(row=self._keys.index(previous))
 
     @property
-    def selected_model(self) -> Optional[str]:
+    def _cursor_index(self) -> Optional[int]:
         if not self._models:
             return None
         row = self.cursor_row
         if row is None or row < 0 or row >= len(self._models):
             return None
-        return self._models[row]
+        return row
 
-    def model_at_screen_y(self, y: int) -> Optional[str]:
-        """Which model is under this absolute screen row (for right-click)."""
+    @property
+    def selected_model(self) -> Optional[str]:
+        i = self._cursor_index
+        return None if i is None else self._models[i]
+
+    @property
+    def selected_key(self) -> Optional[str]:
+        """`model|mode|library` — the row's real identity."""
+        i = self._cursor_index
+        return None if i is None else self._keys[i]
+
+    def key_at_screen_y(self, y: int) -> Optional[str]:
+        """Which job key is under this absolute screen row (for right-click)."""
         offset = y - self.region.y - 1  # -1 for the header row
         index = offset + self.scroll_offset.y
-        if 0 <= index < len(self._models):
-            return self._models[index]
+        if 0 <= index < len(self._keys):
+            return self._keys[index]
         return None
 
     # -- mouse -----------------------------------------------------------
@@ -243,19 +305,19 @@ class QueueTable(DataTable):
         # Right-click: Textual reports button 3 here. Open the verb menu for the
         # row under the pointer, selecting it first so keyboard and mouse agree.
         if event.button == 3:
-            model = self.model_at_screen_y(event.screen_y)
-            if model:
-                if model in self._models:
-                    self.move_cursor(row=self._models.index(model))
+            key = self.key_at_screen_y(event.screen_y)
+            if key:
+                if key in self._keys:
+                    self.move_cursor(row=self._keys.index(key))
                 self.post_message(
-                    self.ContextRequested(model, event.screen_x, event.screen_y)
+                    self.ContextRequested(key, event.screen_x, event.screen_y)
                 )
                 event.stop()
             return
         if event.chain == 2:  # double-click
-            model = self.selected_model
-            if model:
-                self.post_message(self.OpenLog(model))
+            key = self.selected_key
+            if key:
+                self.post_message(self.OpenLog(key))
                 event.stop()
 
 

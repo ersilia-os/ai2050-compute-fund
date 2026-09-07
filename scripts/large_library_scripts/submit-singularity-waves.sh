@@ -40,6 +40,25 @@ WAVE_SIZE="${3:-1000}"
 QUEUE="${4:-cpu-queue}"
 S3_BUCKET="${S3_BUCKET:-ai2050-ersilia-cluster}"
 POLL_SECONDS="${POLL_SECONDS:-30}"
+# Optional per-model packing override, normally set by the scheduler from a `cpus=N`
+# queue flag. EMPTY MEANS "DO NOT PASS IT": the worker's own #SBATCH
+# --cpus-per-task then stands, which is the only value that has actually been tuned
+# against this partition. Passing a number here overrides that directive, so a
+# default baked in on this side would silently re-pack every existing run.
+CPUS_PER_TASK="${CPUS_PER_TASK:-}"
+
+if [ -n "$CPUS_PER_TASK" ]; then
+    if ! [[ "$CPUS_PER_TASK" =~ ^[0-9]+$ ]] || [ "$CPUS_PER_TASK" -lt 1 ] \
+       || [ "$CPUS_PER_TASK" -gt 32 ]; then
+        echo "ERROR: CPUS_PER_TASK must be between 1 and 32 (got '$CPUS_PER_TASK')."
+        exit 1
+    fi
+fi
+
+# Built as an array so the flag is absent — not empty — when there is no override.
+# An empty "" argument to sbatch is a usage error, not a no-op.
+SBATCH_CPUS=()
+[ -n "$CPUS_PER_TASK" ] && SBATCH_CPUS=(--cpus-per-task="$CPUS_PER_TASK")
 
 if [ -z "$MODEL_ID" ] || [ -z "$LIBRARY_NAME" ]; then
     echo "Usage: $0 <model_id> <library_name> [wave_size=1000] [queue=cpu-queue]"
@@ -82,6 +101,7 @@ echo "Model      : $MODEL_ID"
 echo "Library    : $LIBRARY_NAME"
 echo "Wave size  : $WAVE_SIZE chunks/wave"
 echo "Queue      : $QUEUE"
+echo "Cpus/task  : ${CPUS_PER_TASK:-<worker default>}"
 echo "Worker     : $RUN_JOB"
 echo "S3 input   : $S3_INPUT"
 echo "S3 output  : $S3_OUTPUT"
@@ -142,7 +162,11 @@ submit_and_wait() {
     local list="$1" w
     w=$(wc -l < "$list" | tr -d ' ')
     local aid
-    aid=$(sbatch --partition="$QUEUE" --array=0-$((w - 1)) \
+    # ${arr[@]+"${arr[@]}"} — expanding an EMPTY array as "${arr[@]}" is an unbound
+    # variable error under `set -u` on bash 4.2 (the AL2 head node). This form
+    # expands to nothing at all when there is no override.
+    aid=$(sbatch --partition="$QUEUE" ${SBATCH_CPUS[@]+"${SBATCH_CPUS[@]}"} \
+            --array=0-$((w - 1)) \
             "$RUN_JOB" "$MODEL_ID" "$list" "$OUTPUT_DIR" 2>&1 \
           | grep -oP 'Submitted batch job \K\d+')
     if [ -z "$aid" ]; then

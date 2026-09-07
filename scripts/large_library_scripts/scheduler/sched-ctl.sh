@@ -16,7 +16,10 @@
 #   sched-ctl.sh [-q <queue_file>] [--log-dir <dir>] <command> [args]
 #
 # Queue editing (takes effect at the next job boundary):
-#   add <model> <mode> [library] [wave] [queue] [--top|--after <n>]
+#   add <model> <mode> [library] [wave] [queue] [--cpus <n>] [--top|--after <n>]
+#                                --cpus <n> pins SLURM cpus-per-task (1..32) for this
+#                                model only, written as a `cpus=<n>` queue flag.
+#                                Omit it to keep the worker's own tuned default.
 #   rm       <sel>...            remove job(s)
 #   top      <sel>...            move to the front of the queue
 #   up       <sel>...            move one position earlier
@@ -49,7 +52,7 @@
 
 set -uo pipefail
 
-usage() { sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---- global options ---------------------------------------------------------
 CLI_QUEUE=""
@@ -273,12 +276,13 @@ set_hold_flag() {  # $1 = index, $2 = 1|0
 # =============================================================================
 
 cmd_add() {
-    local model="" mode="" lib="" wave="" queue="" where="end" after=""
+    local model="" mode="" lib="" wave="" queue="" where="end" after="" cpus=""
     local pos=()
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --top)   where="top"; shift ;;
             --after) where="after"; after="${2:-}"; shift 2 ;;
+            --cpus)  cpus="${2:-}"; shift 2 ;;
             *)       pos+=("$1"); shift ;;
         esac
     done
@@ -291,6 +295,17 @@ cmd_add() {
     esac
     if [ -n "$wave" ] && { ! [[ "$wave" =~ ^[0-9]+$ ]] || [ "$wave" -lt 1 ] || [ "$wave" -gt 1000 ]; }; then
         echo "ERROR: wave_size must be 1..1000 (got '$wave')" >&2; return 1
+    fi
+    # cpus rides as a FLAG, not a positional field. That is deliberate: a sixth
+    # positional column would reintroduce exactly the bug invariant #7 describes —
+    # a blank middle field is invisible on re-read and every later value shifts left.
+    # As `cpus=N` it can sit anywhere after the model id and cannot be confused with
+    # a wave size or a partition name.
+    if [ -n "$cpus" ] && ! is_valid_cpus "$cpus"; then
+        echo "ERROR: --cpus must be 1..${MAX_CPUS_PER_TASK} (got '$cpus')" >&2
+        echo "       ${MAX_CPUS_PER_TASK} means one task per 32-vCPU node: slowest, but the" >&2
+        echo "       most memory headroom. Omit --cpus to keep the worker's default." >&2
+        return 1
     fi
 
     # Fill in skipped positional fields.
@@ -331,13 +346,14 @@ cmd_add() {
         done
         local n=${#BLK_MODEL[@]}
         BLK_PRE[n]=""; BLK_MODEL[n]="$model"; BLK_MODE[n]="$mode"; BLK_LIB[n]="$lib"
-        BLK_WAVE[n]="$wave"; BLK_QUEUE[n]="$queue"; BLK_FLAGS[n]=""
+        BLK_WAVE[n]="$wave"; BLK_QUEUE[n]="$queue"
+        BLK_FLAGS[n]="${cpus:+cpus=$cpus}"
         case "$where" in
             top)   move_block "$n" 0 ;;
             after) [[ "$after" =~ ^[0-9]+$ ]] && move_block "$n" "$after" ;;
         esac
         write_blocks
-        echo "added: $model $mode ${lib:-<default library>} (${where})"
+        echo "added: $model $mode ${lib:-<default library>}${cpus:+ cpus=$cpus} (${where})"
     }
     queue_locked _do
 }
@@ -448,6 +464,29 @@ state_status_of() {  # $1 = model
     return 1
 }
 
+# Refuse a control-plane verb when there is no driver to receive it.
+#
+# These verbs are one-shot messages that only a RUNNING driver consumes. With none
+# alive the message simply sits in the control dir until the NEXT driver drains it on
+# its first tick — so a `shutdown` posted today makes tomorrow's driver exit on
+# startup, hours after the click that caused it. The driver now discards pre-startup
+# messages for exactly that reason; refusing here is the other half, because printing
+# "shutdown requested" for something that will never happen is worse than an error.
+#
+# Note what is NOT guarded: add / rm / top / up / down / move / hold / unhold / retry
+# all edit the queue file or the status store, and the driver re-reads the queue
+# before every job — so they apply the moment one starts. Staging a queue against a
+# stopped driver is a supported workflow, not a mistake. `pause` is also left alone:
+# its flag survives a restart on purpose, so you can bring a driver up idle.
+require_driver() {  # $1 = verb name, for the message
+    driver_alive && return 0
+    echo "ERROR: no driver is running — '$1' has nothing to act on." >&2
+    echo "       Start one with start-scheduler-tmux.sh." >&2
+    echo "       Queue edits (add/rm/top/up/down/hold/retry) do not need a driver:" >&2
+    echo "       they are written to the queue and apply as soon as one starts." >&2
+    return 1
+}
+
 cmd_cancel() {
     local sel="${1:-}"
     [ -n "$sel" ] || { echo "ERROR: cancel <sel>" >&2; return 1; }
@@ -457,6 +496,17 @@ cmd_cancel() {
         echo "ERROR: no queue entry matches '$sel'" >&2; return 1; }
     model="${BLK_MODEL[idx]}"
     st="$(state_status_of "$model" || echo unknown)"
+    # A `running` row with no live driver is a leftover: the driver died mid-job and
+    # never wrote a verdict (reclaim_stale_running repairs it at the next startup).
+    # Taking the cancel path for it would be wrong twice over — there is no
+    # orchestrator or SLURM array to stop, and the posted message would ambush the
+    # next driver instead. Fall through to hold, which is what the caller actually
+    # wants: do not let this job start.
+    if [ "$st" = "running" ] && ! driver_alive; then
+        echo "note: ${model} is recorded as running but no driver is alive, so that row" >&2
+        echo "      is stale — left behind by a driver that died mid-job." >&2
+        st="stale"
+    fi
     if [ "$st" = "running" ]; then
         control_post cancel "$model"
         echo "cancel requested for RUNNING model ${model} — the driver will scancel its"
@@ -473,11 +523,20 @@ cmd_cancel() {
 cmd_pause()  { mkdir -p "$(control_dir)"; : > "$(paused_flag)"; echo "paused — the driver will not start new jobs"; }
 cmd_resume() { rm -f "$(paused_flag)"; echo "resumed"; }
 cmd_stop_after() {
+    require_driver stop-after-current || return 1
     mkdir -p "$(control_dir)"; : > "$(stopafter_flag)"
     echo "stop-after-current armed — the driver exits when the current model finishes"
 }
-cmd_shutdown() { control_post shutdown ""; echo "shutdown requested — current model will be cancelled"; }
-cmd_refresh()  { control_post refresh "";  echo "S3 recount requested"; }
+cmd_shutdown() {
+    require_driver shutdown || return 1
+    control_post shutdown ""; echo "shutdown requested — current model will be cancelled"
+}
+# Only the driver's own bookkeeping needs this. A client-side recount does not:
+# `dump --live-all` counts S3 directly and works with no driver at all.
+cmd_refresh() {
+    require_driver refresh || return 1
+    control_post refresh "";  echo "S3 recount requested"
+}
 
 cmd_list() {
     load_blocks
@@ -583,6 +642,10 @@ cmd_dump() {
     echo "state_file=${STATE_FILE}"
     echo "status_file=${STATUS_FILE}"
     echo "s3_bucket=${S3_BUCKET}"
+    # Published so the add dialog validates against the cluster's real ceiling rather
+    # than a number hardcoded in the client, which would drift the day the partition
+    # gets bigger instance types.
+    echo "max_cpus_per_task=${MAX_CPUS_PER_TASK}"
     echo "now=$(now_iso)"
 
     echo "---8<--- driver.info"
@@ -594,17 +657,23 @@ cmd_dump() {
     # The authoritative parsed view: queue order with libraries already resolved
     # the way the driver resolves them. Clients read THIS rather than re-parsing
     # the raw queue above, so alias handling has exactly one implementation.
+    # `cpus` is APPENDED as a ninth column, never inserted. A client that predates it
+    # slices the first eight fields and is unaffected; a current client pads short
+    # rows. Inserting mid-row instead would silently shift lib_is_default into the
+    # cpus slot for every un-upgraded TUI still pointed at this cluster.
     echo "---8<--- jobs"
     if [ -n "${QUEUE_FILE:-}" ] && [ -f "$QUEUE_FILE" ]; then
-        printf '#pos\tmodel\tmode\tlibrary\twave\tqueue\tflags\tlib_is_default\n'
+        printf '#pos\tmodel\tmode\tlibrary\twave\tqueue\tflags\tlib_is_default\tcpus\n'
         load_blocks
-        local i lib
+        local i lib jcpus
         for i in "${!BLK_MODEL[@]}"; do
             lib="$(effective_library "${BLK_LIB[i]}")"
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            jcpus="$(queue_flag_value "${BLK_FLAGS[i]}" cpus)" || jcpus=""
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$((i + 1))" "${BLK_MODEL[i]}" "${BLK_MODE[i]}" "$lib" \
                 "${BLK_WAVE[i]}" "${BLK_QUEUE[i]}" "${BLK_FLAGS[i]}" \
-                "$([ -z "${BLK_LIB[i]}" ] && echo 1 || echo 0)"
+                "$([ -z "${BLK_LIB[i]}" ] && echo 1 || echo 0)" \
+                "$jcpus"
         done
     fi
 
@@ -615,11 +684,19 @@ cmd_dump() {
     [ -f "$STATUS_FILE" ] && cat "$STATUS_FILE"
 
     echo "---8<--- libraries"
-    # Canonical library names for the add-dialog's dropdown. Two sources, unioned:
-    # the alias table's canonical names (the `echo "Name"` arms of resolve_library),
-    # and any library already referenced by this queue or status store — which is how
-    # newer libraries not yet in the alias table (e.g. the 1.4B) still show up.
+    # Library names for the add-dialog's dropdown. THREE sources, unioned:
+    #
+    #   1. what actually exists in S3 under input/  <- the authoritative list
+    #   2. the alias table's canonical names (the `echo "Name"` arms), so a library
+    #      that is aliased but not yet ingested still offers itself
+    #   3. anything already referenced by this queue or status store
+    #
+    # (1) is the one that matters and was missing: the alias table knows only five
+    # names, so every library ingested since — the h3d selections, the 44g subsets —
+    # was absent from the dropdown unless it happened to be in the queue already.
+    # Refreshed from S3 on a --live dump, served from cache otherwise.
     {
+        s3_list_libraries ${live:+refresh}
         for cand in /shared/scripts/library-aliases.sh \
                     "${SCRIPT_DIR}/../../AWS_templates/library-aliases.sh" \
                     /shared/scripts/AWS_templates/library-aliases.sh; do

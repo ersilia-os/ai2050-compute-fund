@@ -9,6 +9,7 @@ No cluster, no AWS, no SSH needed.
 
 from scheduler_tui.model import (
     Snapshot,
+    flag_value,
     is_queue_flag,
     parse_dump,
     parse_queue_line,
@@ -273,3 +274,131 @@ class TestEmptySnapshot:
         assert snap.counts() == {}
         assert snap.running_job() is None
         assert snap.find("anything") is None
+
+
+# Nine columns: `cpus` appended after lib_is_default. The eight-column
+# JOBS_SECTION above is deliberately left as-is — it is the regression test for a
+# cluster whose scheduler/ has not been redeployed yet.
+JOBS_SECTION_CPUS = """\
+---8<--- jobs
+#pos\tmodel\tmode\tlibrary\twave\tqueue\tflags\tlib_is_default\tcpus
+1\teos_heavy\tersilia\tCoconut_715K\t\t\tcpus=16\t0\t16
+2\teos_plain\tersilia\tCoconut_715K\t\t\t\t0\t
+3\teos_both\tersilia\tCoconut_715K\t\t\thold cpus=32\t0\t32
+"""
+
+
+class TestCpusOverride:
+    """`cpus=N` decides how densely tasks pack a node, and cpu-queue does no memory
+    accounting — so a job displayed without its override looks identical to one that
+    will OOM. The column and the flags string must never disagree."""
+
+    def _dump(self, jobs_section):
+        head = DUMP[: DUMP.index("---8<--- state.tsv")]
+        return head + jobs_section + "---8<--- status.tsv\n"
+
+    def test_reads_the_cpus_column(self):
+        snap = parse_dump(self._dump(JOBS_SECTION_CPUS))
+        assert snap.find("eos_heavy").cpus == "16"
+        assert snap.find("eos_both").cpus == "32"
+
+    def test_absent_override_is_empty_not_a_default(self):
+        """Empty must stay empty: the driver turns "" into "pass no
+        --cpus-per-task at all", so inventing a number here would silently re-pack
+        the job with a value nobody tuned."""
+        snap = parse_dump(self._dump(JOBS_SECTION_CPUS))
+        assert snap.find("eos_plain").cpus == ""
+
+    def test_cpus_coexists_with_hold(self):
+        job = parse_dump(self._dump(JOBS_SECTION_CPUS)).find("eos_both")
+        assert job.hold and job.cpus == "32"
+
+    def test_falls_back_to_flags_when_ctl_is_older(self):
+        """An eight-column ctl still honours a `cpus=` flag it cannot report, so read
+        it out of `flags` rather than showing the job as un-overridden."""
+        older = (
+            "---8<--- jobs\n"
+            "#pos\tmodel\tmode\tlibrary\twave\tqueue\tflags\tlib_is_default\n"
+            "1\teos_heavy\tersilia\tCoconut_715K\t\t\tcpus=16\t0\n"
+            "2\teos_plain\tersilia\tCoconut_715K\t\t\t\t0\n"
+        )
+        snap = parse_dump(self._dump(older))
+        assert snap.find("eos_heavy").cpus == "16"
+        assert snap.find("eos_plain").cpus == ""
+
+    def test_parsed_from_raw_queue_text_too(self):
+        """The no-jobs-section fallback path must not lose the override either."""
+        dump = DUMP.replace(
+            "eos6ojg_v1          ersilia      Enamine_Real_Sample_1.4B     hold",
+            "eos6ojg_v1          ersilia      Enamine_Real_Sample_1.4B     hold cpus=8",
+        )
+        snap = parse_dump(dump)
+        job = snap.find("eos6ojg_v1")
+        assert job.cpus == "8" and job.hold
+
+
+class TestMaxCpus:
+    def test_reads_the_published_ceiling(self):
+        dump = DUMP.replace("schema=1", "schema=1\nmax_cpus_per_task=64")
+        assert parse_dump(dump).max_cpus_per_task == 64
+
+    def test_defaults_when_ctl_does_not_publish_it(self):
+        """A ctl too old to publish it still has to give the add dialog a bound."""
+        assert parse_dump(DUMP).max_cpus_per_task == 32
+
+
+class TestFlagValue:
+    """Mirror of queue_flag_value in scheduler-lib.sh."""
+
+    def test_reads_a_key_value_flag(self):
+        assert flag_value("hold cpus=16", "cpus") == "16"
+
+    def test_missing_key_is_empty(self):
+        assert flag_value("hold", "cpus") == ""
+        assert flag_value("", "cpus") == ""
+
+    def test_does_not_match_a_key_that_merely_ends_the_same(self):
+        assert flag_value("maxcpus=4", "cpus") == ""
+
+
+DUP_JOBS = """\
+---8<--- runtime
+schema=1
+driver_alive=1
+paused=0
+stop_after_current=0
+---8<--- driver.info
+pid=1
+---8<--- jobs
+#pos\tmodel\tmode\tlibrary\twave\tqueue\tflags\tlib_is_default\tcpus
+1\tmtb-public-models\tsingularity\tEnamine_Real_44g_selected_100M\t\t\t\t0\t
+2\teos21dr_v4\tersilia\tEnamine_Liquid_Stock_2.5M\t\t\tcpus=8\t0\t8
+3\teos21dr_v4\tersilia\tMolport_Screening_Compounds_5.3M\t\t\t\t0\t
+---8<--- status.tsv
+---8<--- end
+"""
+
+
+class TestDuplicateModel:
+    """The same model queued against two libraries is legitimate — and it once
+    crashed the table with DuplicateKey because rows were keyed by model id."""
+
+    def setup_method(self):
+        self.snap = parse_dump(DUP_JOBS)
+
+    def test_both_rows_survive(self):
+        assert [j.pos for j in self.snap.jobs] == [1, 2, 3]
+        assert self.snap.model_count("eos21dr_v4") == 2
+
+    def test_keys_are_unique(self):
+        keys = [j.key for j in self.snap.jobs]
+        assert len(keys) == len(set(keys))
+
+    def test_find_by_key_picks_the_right_one(self):
+        job = self.snap.find_by_key("eos21dr_v4|ersilia|Molport_Screening_Compounds_5.3M")
+        assert job.pos == 3
+        assert job.library == "Molport_Screening_Compounds_5.3M"
+
+    def test_find_by_model_is_the_first_and_therefore_ambiguous(self):
+        # documents why find() must not be used for identity
+        assert self.snap.find("eos21dr_v4").pos == 2

@@ -18,7 +18,7 @@ model's whole library is processed, exit 0/1, and are resumable.
 | File | Role |
 |------|------|
 | `run-model-queue.sh` | The driver: re-read queue → pre-flight → dispatch the orchestrator → poll it → record status. Runs in tmux. |
-| `sched-ctl.sh` | Control CLI: add / rm / top / up / down / move / hold / retry / pause / cancel / list / dump. |
+| `sched-ctl.sh` | Control CLI: add (`--cpus N`) / rm / top / up / down / move / hold / retry / pause / cancel / list / dump. |
 | `scheduler-status.sh` | Renders the status table; live-counts done/total from S3. Safe under `watch`. |
 | `scheduler-lib.sh` | Shared helpers (S3 counting, queue parsing, status store, locking). Sourced, not run. |
 | `start-scheduler-tmux.sh` | Starts the driver detached in a tmux session `scheduler`. |
@@ -35,7 +35,9 @@ One job per line; `#`/blank lines ignored; whitespace-separated:
 `default_library`. `wave_size` 1..1000 (default 1000); `queue` default `cpu-queue`.
 
 **Line order is the priority** — jobs run top-to-bottom, so "prioritize" means
-"move up". The only flag today is `hold`, which parks a job until you unhold it.
+"move up". Flags today are `hold`, which parks a job until you unhold it, and
+`cpus=N` (1..32), which pins SLURM `cpus-per-task` for that job only —
+the packing lever on a CR_CPU partition, so raise it for models that OOM.
 Flags are recognised by shape, so they can go anywhere after the model id:
 `eos3b5e ersilia coconut hold` works.
 

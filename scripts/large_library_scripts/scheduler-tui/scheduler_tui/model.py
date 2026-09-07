@@ -54,6 +54,8 @@ class Job:
     wave: str = ""
     queue: str = ""
     flags: str = ""
+    #: per-job SLURM cpus-per-task override ("" = the worker's own #SBATCH default)
+    cpus: str = ""
     hold: bool = False
     library_is_default: bool = False
     #: True when `done` came from a fresh S3 recount rather than the driver's record
@@ -126,6 +128,16 @@ class Snapshot:
         return self.driver_info.get("default_library", "")
 
     @property
+    def max_cpus_per_task(self) -> int:
+        """Ceiling for a per-job cpus override, as reported by ctl.
+
+        Read from the dump rather than hardcoded so the client tracks the cluster:
+        the fallback only applies against a ctl too old to publish it.
+        """
+        raw = self.runtime.get("max_cpus_per_task", "")
+        return _int(raw) if raw.isdigit() else 32
+
+    @property
     def driver_state(self) -> str:
         """One word for the header: what is this scheduler doing right now."""
         if not self.driver_alive:
@@ -151,10 +163,22 @@ class Snapshot:
         return None
 
     def find(self, model: str) -> Optional[Job]:
+        """First job with this model id. Ambiguous when a model is queued against
+        several libraries — prefer :meth:`find_by_key` wherever identity matters."""
         for job in self.jobs:
             if job.model == model:
                 return job
         return None
+
+    def find_by_key(self, key: str) -> Optional[Job]:
+        """The one job with this `model|mode|library`."""
+        for job in self.jobs:
+            if job.key == key:
+                return job
+        return None
+
+    def model_count(self, model: str) -> int:
+        return sum(1 for job in self.jobs if job.model == model)
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +317,12 @@ def _read_jobs(sections: Dict[str, List[str]], default_library: str) -> List[Job
             parts = line.split("\t")
             if len(parts) < 4:
                 continue
-            parts += [""] * (8 - len(parts))
-            pos, model, mode, library, wave, queue, flags, is_default = parts[:8]
+            # cpus is the ninth column, appended by a newer ctl. Padding rather than
+            # requiring it keeps this client working against a cluster whose
+            # scheduler/ has not been redeployed yet — the override just reads empty.
+            parts += [""] * (9 - len(parts))
+            (pos, model, mode, library, wave, queue,
+             flags, is_default, cpus) = parts[:9]
             jobs.append(
                 Job(
                     pos=_int(pos),
@@ -304,6 +332,9 @@ def _read_jobs(sections: Dict[str, List[str]], default_library: str) -> List[Job
                     wave=wave,
                     queue=queue,
                     flags=flags,
+                    # Fall back to the flags string when the column is absent, so an
+                    # older ctl still shows the override it is honouring.
+                    cpus=cpus or flag_value(flags, "cpus"),
                     hold=_has_hold(flags),
                     library_is_default=is_default == "1",
                 )
@@ -327,6 +358,7 @@ def _read_jobs(sections: Dict[str, List[str]], default_library: str) -> List[Job
                 wave=wave,
                 queue=queue,
                 flags=flags,
+                cpus=flag_value(flags, "cpus"),
                 hold=_has_hold(flags),
                 library_is_default=not library,
             )
@@ -336,6 +368,15 @@ def _read_jobs(sections: Dict[str, List[str]], default_library: str) -> List[Job
 
 def _has_hold(flags: str) -> bool:
     return any(f in ("hold", "hold=1", "hold=true") for f in flags.split())
+
+
+def flag_value(flags: str, key: str) -> str:
+    """Mirror of ``queue_flag_value`` in scheduler-lib.sh. "" when absent."""
+    prefix = f"{key}="
+    for token in flags.split():
+        if token.startswith(prefix):
+            return token[len(prefix):]
+    return ""
 
 
 def _parse_counts(lines: List[str]) -> Dict[str, Dict[str, Optional[int]]]:

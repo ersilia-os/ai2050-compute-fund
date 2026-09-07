@@ -8,8 +8,15 @@
 #   wave_size : 1..1000  (optional -> default 1000)
 #   queue     : SLURM partition (optional -> default cpu-queue)
 #   flags     : `hold` parks the job — the driver skips it until you unhold it.
+#               `cpus=N` (1..32) pins SLURM cpus-per-task for THIS job only.
 #               Flags are recognised by shape, so they can appear anywhere after
 #               the model id: `eos3b5e ersilia coconut hold` is fine.
+#
+#   cpus=N is the packing lever. cpu-queue is CR_CPU — SLURM does no memory
+#   accounting there — so cpus-per-task alone decides how many tasks share a
+#   32-vCPU node, and a heavy model left at the default will OOM. Bigger N =
+#   fewer tasks per node = more memory each = slower. Omit it to keep the
+#   worker's own tuned default (ersilia 10, singularity 4).
 #
 # Blank lines and lines starting with '#' (even indented) are ignored.
 #
@@ -37,7 +44,9 @@ mtb-public-models   singularity  molport                    500
 
 # parked until you run: sched-ctl.sh unhold eos12x7_v1
 eos12x7_v1          ersilia      Enamine_Real_Sample_1.4B                     hold
-eos11sm_v1          ersilia      Enamine_Real_Sample_1.4B
+
+# a memory-hungry model: 8 tasks/node instead of the default packing
+eos11sm_v1          ersilia      Enamine_Real_Sample_1.4B                     cpus=4
 eos6ojg_v1          ersilia      Enamine_Real_Sample_1.4B
 eos74km_v1          ersilia      Enamine_Real_Sample_1.4B
 eos42ez_v1          ersilia      Enamine_Real_Sample_1.4B

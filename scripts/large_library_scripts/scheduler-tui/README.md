@@ -86,9 +86,11 @@ Every action has both a key and a click. Nothing is keyboard-only.
 
 Also mouse-driven: click a row to select, **double-click** to open its log,
 **right-click** for the same verbs as a menu, click a status chip to filter the
-table, click a column header to sort, drag the divider to resize the log pane,
-scroll wheel anywhere. Destructive verbs (cancel, remove) ask first and name the
-model.
+table, drag the divider to resize the log pane, scroll wheel anywhere. Destructive
+verbs (cancel, remove) ask first and name the model.
+
+The table is always in queue order, because that order *is* the run order — sorting
+it by another column would hide the one thing the position column means.
 
 Reading the table: a library shown with a trailing `*` came from the driver's
 `default_library` rather than the queue line. Aliases (`molport`) are displayed
