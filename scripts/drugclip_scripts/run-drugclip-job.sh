@@ -148,6 +148,17 @@ apptainer exec \
         --save-dir "$TMP_OUTPUT" \
         --write-h5 \
         $GPU_FLAG
+ENCODE_RC=$?
+
+# The encoder can die part-way (GPU OOM when several array tasks share a node is the
+# common one) and still leave a correctly-shaped, mostly-zero h5 behind — encode_mols
+# pre-allocates with require_dataset and fills fold-major. Without this check the non-zero
+# exit was simply ignored and the partial file was promoted to /fsx as if complete.
+if [ "$ENCODE_RC" -ne 0 ]; then
+    echo "ERROR: encode_mols.py exited $ENCODE_RC for chunk $CHUNK_NUM — output is incomplete"
+    echo "  (if this is GPU OOM, throttle concurrent array tasks: MAX_CONCURRENT=N submit-drugclip.sh)"
+    exit "$ENCODE_RC"
+fi
 
 # ── Move output to final path ─────────────────────────────────────────────────
 # encode_mols.py outputs: mol_reps.h5 (no start/end → no suffix)
@@ -164,18 +175,37 @@ if [ -z "$TMP_H5" ] || [ ! -f "$TMP_H5" ]; then
     exit 1
 fi
 
-# Validate H5 is not empty before accepting it
+# Validate the H5 is COMPLETE before accepting it.
+#
+# A shape check cannot fail: encode_mols_multi_folds does
+#   dset = hdf5.require_dataset("mol_reps", shape=(len(mol_dataset), 768))
+# which pre-allocates the full array as zeros, then fills it positionally in a
+#   for fold in range(6): for batch in ...
+# loop. A job that dies part-way leaves a correctly-shaped h5 whose later folds are
+# all-zero — and a row with fold 0 written is not all-zero, so it also survives a naive
+# "any zero rows?" test. Check every fold mask is full AND every per-fold 128-block is
+# actually unit-norm.
 N_EMBEDDINGS=$(/shared/python39/bin/python3.9 -c "
 import h5py, sys
+import numpy as np
 try:
     with h5py.File('$TMP_H5', 'r') as f:
-        print(f['mol_reps'].shape[0])
+        n = f['mol_reps'].shape[0]
+        if n == 0:
+            print(0); sys.exit()
+        folds = sorted(k for k in f.keys() if k.startswith('fold'))
+        if len(folds) != 6 or any(int(f[k][:].sum()) != n for k in folds):
+            print(0); sys.exit()
+        X = f['mol_reps'][:].reshape(n, 6, 128)
+        if float(np.linalg.norm(X, axis=2).min()) < 0.9:
+            print(0); sys.exit()
+        print(n)
 except Exception:
     print(0)
 " 2>/dev/null)
 
 if [ -z "$N_EMBEDDINGS" ] || [ "$N_EMBEDDINGS" -le 0 ]; then
-    echo "WARNING: HDF5 is empty — launching bisect for chunk $CHUNK_NUM"
+    echo "WARNING: HDF5 is empty or has incomplete folds — launching bisect for chunk $CHUNK_NUM"
 
     BISECT_DIR="${OUTPUT_BASE}/bisect_${CHUNK_NUM}"
     mkdir -p "$BISECT_DIR"

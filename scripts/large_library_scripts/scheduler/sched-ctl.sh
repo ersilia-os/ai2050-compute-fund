@@ -454,13 +454,42 @@ cmd_retry() {
 }
 
 # Status of a model according to the render view (no S3 calls).
-state_status_of() {  # $1 = model
+# Status of ONE job, identified by its full key.
+#
+# Never look this up by model id: the same model is legitimately queued against
+# several libraries, and the first match is then the wrong row. Getting this wrong
+# meant `cancel` on a running job read the status of a DIFFERENT, already-done row
+# and quietly held that one instead of stopping the job in flight.
+status_of_key() {  # $1 = model|mode|library
+    local want="$1"
+    status_load
+    if [ -n "${ST_STATUS[$want]:-}" ]; then echo "${ST_STATUS[$want]}"; return 0; fi
+
+    # No entry in the durable store (e.g. a pre-upgrade driver): fall back to
+    # state.tsv, matched on the whole triple rather than just the model.
     [ -f "$STATE_FILE" ] || return 1
-    local idx model mode lib status rest
-    while IFS=$'\t' read -r idx model mode lib status rest; do
+    local wm="${want%%|*}" rest="${want#*|}" wmode wlib
+    wmode="${rest%%|*}"; wlib="${rest#*|}"
+    local idx model mode lib status _r
+    while IFS=$'\t' read -r idx model mode lib status _r; do
         case "$idx" in ''|'#'*) continue ;; esac
-        [ "$model" = "$1" ] && { echo "$status"; return 0; }
+        if [ "$model" = "$wm" ] && [ "$mode" = "$wmode" ] && [ "$lib" = "$wlib" ]; then
+            echo "$status"; return 0
+        fi
     done < "$STATE_FILE"
+    return 1
+}
+
+# Block index whose resolved identity equals this key. Survives a reload, which a
+# raw index does not.
+resolve_key() {  # $1 = model|mode|library
+    local want="$1" i
+    for i in "${!BLK_MODEL[@]}"; do
+        if [ "$(job_key "${BLK_MODEL[i]}" "${BLK_MODE[i]}" \
+                        "$(effective_library "${BLK_LIB[i]}")")" = "$want" ]; then
+            echo "$i"; return 0
+        fi
+    done
     return 1
 }
 
@@ -495,7 +524,11 @@ cmd_cancel() {
     idx="$(resolve_sel "$sel" | head -n 1)" || {
         echo "ERROR: no queue entry matches '$sel'" >&2; return 1; }
     model="${BLK_MODEL[idx]}"
-    st="$(state_status_of "$model" || echo unknown)"
+    local lib key label
+    lib="$(effective_library "${BLK_LIB[idx]}")"
+    key="$(job_key "$model" "${BLK_MODE[idx]}" "$lib")"
+    label="${model} on ${lib:-<no library>}"
+    st="$(status_of_key "$key" || echo unknown)"
     # A `running` row with no live driver is a leftover: the driver died mid-job and
     # never wrote a verdict (reclaim_stale_running repairs it at the next startup).
     # Taking the cancel path for it would be wrong twice over — there is no
@@ -503,20 +536,22 @@ cmd_cancel() {
     # next driver instead. Fall through to hold, which is what the caller actually
     # wants: do not let this job start.
     if [ "$st" = "running" ] && ! driver_alive; then
-        echo "note: ${model} is recorded as running but no driver is alive, so that row" >&2
+        echo "note: ${label} is recorded as running but no driver is alive, so that row" >&2
         echo "      is stale — left behind by a driver that died mid-job." >&2
         st="stale"
     fi
     if [ "$st" = "running" ]; then
-        control_post cancel "$model"
-        echo "cancel requested for RUNNING model ${model} — the driver will scancel its"
+        # Post the KEY, not the model: the driver matches either, and the key cannot
+        # name the wrong library.
+        control_post cancel "$key"
+        echo "cancel requested for RUNNING ${label} — the driver will scancel its"
         echo "in-flight SLURM array and move on (within ${CTL_POLL:-15}s)."
     else
-        _do() { load_blocks; local i; i="$(resolve_sel "$model" | head -n 1)" || return 1
+        _do() { load_blocks; local i; i="$(resolve_key "$key")" || return 1
                 set_hold_flag "$i" 1; write_blocks; }
         queue_locked _do
-        echo "${model} is not running (status: ${st}) — held instead, so it will not start."
-        echo "Use 'rm ${model}' to drop it from the queue entirely."
+        echo "${label} is not running (status: ${st}) — held instead, so it will not start."
+        echo "Use 'rm ${sel}' to drop it from the queue entirely."
     fi
 }
 
@@ -603,7 +638,7 @@ emit_counts() {  # $1 = scope: running | all
         st="${ST_STATUS[$key]:-}"
         # No status store means a pre-upgrade driver: fall back to its state.tsv so
         # we still know which row is the running one.
-        [ -n "$st" ] || st="$(state_status_of "${BLK_MODEL[i]}" 2>/dev/null || echo pending)"
+        [ -n "$st" ] || st="$(status_of_key "$key" 2>/dev/null || echo pending)"
         dn=""
         if [ "$scope" = "all" ] || [ "$st" = "running" ]; then
             dn="$(s3_count_output "${BLK_MODEL[i]}" "$lib" "${BLK_MODE[i]}")"

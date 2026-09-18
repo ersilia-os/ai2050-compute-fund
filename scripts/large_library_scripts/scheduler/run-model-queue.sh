@@ -415,22 +415,30 @@ ensure_sif() {  # $1=model $2=logfile ; 0 if present (or fetched), 1 otherwise
 # Cancel the orchestrator we launched, plus whatever it has in flight on SLURM.
 # Array job ids are scraped from THIS JOB'S LOG ONLY, so we can never scancel a
 # job the scheduler did not start.
-# Is this process group safe to signal — i.e. definitely NOT ours?
+# Every descendant of a pid, deepest first.
 #
-# A group-kill is the only way to take down an orchestrator and its subshells, but
-# it is also the only thing in this script that can kill the driver itself. If the
-# child ever ends up in our group (setsid unavailable, a pgid lookup that returned
-# something unexpected, the CHILD_PGID:=CHILD_PID fallback landing on our own group)
-# then `kill -KILL -$CHILD_PGID` SIGKILLs this driver, its tmux pane and the tmux
-# server, untrappably — no cleanup, stale lock, orchestrator left running. That is
-# exactly the outage seen on 2026-09-04, so the group is now checked before use.
-group_is_safe() {  # $1 = candidate pgid
-    local pgid="$1"
-    [ -n "$pgid" ] || return 1
-    [ "$pgid" -gt 1 ] 2>/dev/null || return 1
-    [ "$pgid" != "$SELF_PGID" ] || return 1
-    [ "$pgid" != "$$" ] || return 1
-    return 0
+# Walking DOWN from the orchestrator is the whole point: a process-group kill was
+# the only thing in this script that could reach the driver itself, and on the
+# cluster it did exactly that twice — killing the driver, its tmux pane and the tmux
+# server, untrappably (no cleanup, stale lock, orphaned orchestrator). A tree walk
+# rooted at the child cannot reach its own parent by construction, and the manual
+# `kill <orchestrator pid>` recovery has proved sufficient in practice.
+descendants_of() {  # $1 = pid ; echoes children before parents
+    local pid="$1" child
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+        descendants_of "$child"
+    done
+    printf '%s\n' "$pid"
+}
+
+# Signal a pid and everything under it. Never signals a process group, so it can
+# never reach this driver.
+kill_tree() {  # $1 = signal, $2 = root pid
+    local sig="$1" root="$2" pid
+    for pid in $(descendants_of "$root"); do
+        [ "$pid" = "$$" ] && continue          # belt and braces: never ourselves
+        kill "-${sig}" "$pid" 2>/dev/null
+    done
 }
 
 cancel_child() {  # $1 = logfile
@@ -444,26 +452,24 @@ cancel_child() {  # $1 = logfile
     # fires its own "resubmit once" retry. You cancel a wave and a fresh one appears.
     # A dead orchestrator cannot react to anything.
     local waited=0
-    if group_is_safe "${CHILD_PGID:-}"; then
-        log_line "  terminating orchestrator process group ${CHILD_PGID} (driver pgid ${SELF_PGID})"
-        kill -TERM -"$CHILD_PGID" 2>/dev/null
+    if [ -n "${CHILD_PID:-}" ]; then
+        log_line "  stopping orchestrator pid ${CHILD_PID} and its children" \
+                 "(driver pid $$, pgid ${SELF_PGID})"
+        kill_tree TERM "$CHILD_PID"
         while kill -0 "$CHILD_PID" 2>/dev/null && [ "$waited" -lt 10 ]; do
             sleep 1; waited=$((waited + 1))
         done
-        kill -0 "$CHILD_PID" 2>/dev/null && kill -KILL -"$CHILD_PGID" 2>/dev/null
-    elif [ -n "${CHILD_PID:-}" ]; then
-        # Refuse the group-kill and signal only the child. Its subshells may outlive
-        # it — warn, because that is a leak the operator has to finish by hand — but
-        # never take the driver down to avoid it.
-        log_line "  WARNING: orchestrator pgid '${CHILD_PGID:-<unknown>}' is not a separate"
-        log_line "           process group (driver pgid ${SELF_PGID}). Signalling pid"
-        log_line "           ${CHILD_PID} only, to avoid killing this driver."
-        log_line "           Check for leftovers:  pgrep -af 'submit-(ersilia|singularity)-waves'"
-        kill -TERM "$CHILD_PID" 2>/dev/null
-        while kill -0 "$CHILD_PID" 2>/dev/null && [ "$waited" -lt 10 ]; do
-            sleep 1; waited=$((waited + 1))
-        done
-        kill -0 "$CHILD_PID" 2>/dev/null && kill -KILL "$CHILD_PID" 2>/dev/null
+        if kill -0 "$CHILD_PID" 2>/dev/null; then
+            log_line "  did not exit on TERM after ${waited}s — sending KILL"
+            kill_tree KILL "$CHILD_PID"
+            sleep 1
+        fi
+        if kill -0 "$CHILD_PID" 2>/dev/null; then
+            log_line "  WARNING: orchestrator pid ${CHILD_PID} is still alive."
+            log_line "           Check by hand: pgrep -af 'submit-(ersilia|singularity)-waves'"
+        else
+            log_line "  orchestrator stopped"
+        fi
     fi
 
     # Now that nothing can resubmit, drop whatever it left on the queue. Ids come

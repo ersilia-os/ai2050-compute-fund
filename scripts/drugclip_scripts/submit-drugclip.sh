@@ -76,6 +76,15 @@ echo "Chunk list: $CHUNK_LIST"
 
 # ── Submit in batches of 1000 (Slurm MaxArraySize limit) ─────────────────────
 MAX_ARRAY_SIZE=1000
+
+# Cap concurrently RUNNING array tasks. Slurm will happily pack many tasks onto one GPU
+# node; several DrugCLIP encoders on a single g6.4xlarge exhaust GPU memory and the encode
+# dies part-way through, leaving a correctly-shaped but mostly-zero h5. Set to 0 for the
+# old unthrottled behaviour.
+MAX_CONCURRENT=${MAX_CONCURRENT:-4}
+THROTTLE=""
+[ "$MAX_CONCURRENT" -gt 0 ] 2>/dev/null && THROTTLE="%${MAX_CONCURRENT}"
+
 ARRAY_IDS=()
 BATCH=0
 START=0
@@ -92,7 +101,7 @@ while [ $START -lt $NUM_CHUNKS ]; do
 
     ARRAY_ID=$(sbatch \
         --partition="$QUEUE" \
-        --array=0-$((BATCH_SIZE - 1)) \
+        --array=0-$((BATCH_SIZE - 1))${THROTTLE} \
         "${SCRIPT_DIR}/run-drugclip-job.sh" \
         "$LIBRARY_NAME" \
         "$BATCH_LIST" \

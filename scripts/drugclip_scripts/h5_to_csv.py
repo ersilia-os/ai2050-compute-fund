@@ -51,6 +51,29 @@ def detect_smiles_col(fieldnames):
     return None
 
 
+def loader_row_order(all_smiles, success_smiles):
+    """Map h5 row index → SMILES, accounting for the encoder's lexicographic ordering.
+
+    unimol's load_mols_dataset_dtwg (Drug-The-Whole-Genome/unimol/tasks/drugclip.py:498)
+    does `sorted(list(set(keys)))` on the LMDB "success" keys, which are STRINGS. The
+    dataset is therefore ordered LEXICOGRAPHICALLY — "0", "1", "10", "100", "1000", ... —
+    whereas the companion .smiles.txt is written in input order. mol_reps row r holds the
+    molecule at lexicographic position r, NOT input position r.
+
+    The keys are written as `str(n_ok)` (smiles_to_lmdb.py:155), a counter over SUCCESSFUL
+    molecules — not the input row index — so key i belongs to line i of .smiles.txt and the
+    permutation follows from the success count alone.
+
+    `all_smiles` is accepted for call-site compatibility and deliberately unused: deriving
+    the keys from input row indices is wrong for any chunk where RDKit dropped a molecule,
+    because the missing index shifts every lexicographic position after it.
+
+    Returns the SMILES in h5 row order.
+    """
+    order = sorted(range(len(success_smiles)), key=str)
+    return [success_smiles[o] for o in order]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="DrugCLIP HDF5 + SMILES index → ersilia CSV"
@@ -59,6 +82,10 @@ def main():
     parser.add_argument("--h5",           required=True, help="mol_reps.h5 from encode_mols.py")
     parser.add_argument("--smiles-index", required=True, help="Companion .smiles.txt (successful molecules only)")
     parser.add_argument("--output",       required=True, help="Output CSV path")
+    parser.add_argument("--row-order", choices=["lexicographic", "input"], default="lexicographic",
+                        help="How h5 rows map to .smiles.txt. 'lexicographic' (default) undoes the "
+                             "string sort in drugclip.py:498. Switch to 'input' ONLY if the sif is "
+                             "ever rebuilt with that sort fixed — otherwise you double-correct.")
     args = parser.parse_args()
 
     input_path  = Path(args.input)
@@ -96,12 +123,31 @@ def main():
         )
         sys.exit(1)
 
+    # ── Reject incomplete encodes ─────────────────────────────────────────────
+    # require_dataset() pre-allocates zeros and the encode loop fills fold-major, so a job
+    # that died part-way leaves a correctly-shaped h5 whose later folds are all zero. A row
+    # with only fold 0 written is not all-zero, so nothing but a per-fold norm check spots it.
+    if len(embeddings):
+        fold_norms = np.linalg.norm(embeddings.reshape(len(embeddings), 6, 128), axis=2)
+        if float(fold_norms.min()) < 0.9:
+            complete = int((fold_norms > 0.9).all(axis=1).sum())
+            log.error(f"Incomplete encode: only {complete}/{len(embeddings)} rows have all 6 folds")
+            sys.exit(1)
+
+    # ── Pair rows with molecules ──────────────────────────────────────────────
+    if args.row_order == "lexicographic":
+        row_smiles = loader_row_order(all_smiles, success_smiles)
+        if row_smiles is None:
+            log.error("Cannot recover encoder row order: a success SMILES is not in the input CSV")
+            sys.exit(1)
+    else:
+        row_smiles = success_smiles
+    emb_of = {smi: embeddings[r] for r, smi in enumerate(row_smiles)}
+    log.info(f"Row order  : {args.row_order}")
+
     # ── Write CSV ─────────────────────────────────────────────────────────────
     n_success = 0
     n_failed  = 0
-
-    success_iter = iter(zip(success_smiles, embeddings))
-    next_smi, next_emb = next(success_iter, (None, None))
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -109,9 +155,9 @@ def main():
 
         for smi in all_smiles:
             key = hashlib.md5(smi.encode("utf-8")).hexdigest()
-            if smi == next_smi:
-                writer.writerow([key, smi] + next_emb.tolist())
-                next_smi, next_emb = next(success_iter, (None, None))
+            emb = emb_of.get(smi)
+            if emb is not None:
+                writer.writerow([key, smi] + emb.tolist())
                 n_success += 1
             else:
                 writer.writerow([key, smi] + EMPTY_RESULT)

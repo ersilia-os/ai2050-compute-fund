@@ -41,31 +41,89 @@ import h5py
 import numpy as np
 
 
-def _load_pairs(emb_dir, library=None):
-    """Load (smiles_list, emb (N,768)) from all matching *_drugclip_*.h5 + .smiles.txt."""
+SMILES_COLS = ("smiles", "canonical_smiles", "input")
+
+
+def _loader_row_order(input_csv, smis):
+    """Reorder `smis` (input order) into the order the encoder actually wrote h5 rows.
+
+    unimol's load_mols_dataset_dtwg (Drug-The-Whole-Genome/unimol/tasks/drugclip.py:498)
+    does `sorted(list(set(keys)))` on the LMDB "success" keys, which are STRINGS. So the
+    dataset is ordered LEXICOGRAPHICALLY — "0", "1", "10", "100", "1000", ... — while
+    <chunk>.smiles.txt is written in input order. mol_reps row r therefore holds the
+    molecule at lexicographic position r, not input position r.
+
+    The keys are written as `str(n_ok)` (smiles_to_lmdb.py:155), a counter over SUCCESSFUL
+    molecules — not the input row index. Key i therefore belongs to line i of .smiles.txt,
+    and the permutation is fixed by the number of successes alone.
+
+    `input_csv` is accepted for call-site compatibility and deliberately unused. Deriving the
+    keys from input row indices is wrong for any chunk where RDKit dropped a molecule: the
+    missing index leaves a hole that shifts every lexicographic position after it. On a
+    2,000-row chunk a single failure at input 1500 mispairs 102 rows; one at input 5 mispairs
+    1997 of 1999.
+    """
+    order = sorted(range(len(smis)), key=str)
+    return [smis[o] for o in order]
+
+
+def _load_pairs(emb_dir, library=None, input_dir=None):
+    """Load (smiles_list, emb (N,768)) from all matching *_drugclip_*.h5 + .smiles.txt.
+
+    Two correctness guards, both of which the raw files fail silently without:
+      - rows are re-paired with SMILES in the encoder's lexicographic order (see
+        _loader_row_order); `input_dir` must hold the <library>_chunk_NNN.csv inputs.
+      - chunks with incomplete folds are dropped. require_dataset() pre-allocates zeros
+        and the encode loop fills fold-major, so a job that dies part-way leaves a
+        correctly-shaped h5 whose later folds are all zero.
+    """
     pat = f"{library}_drugclip_*.h5" if library else "*_drugclip_*.h5"
     h5_files = sorted(glob.glob(os.path.join(emb_dir, pat)))
+    if input_dir is None and library:
+        input_dir = os.path.join("/fsx/input", library)
     smiles_all, embs_all = [], []
+    n_skip_fold = n_skip_order = 0
     for h5f in h5_files:
+        base = os.path.basename(h5f)
         smi_txt = h5f[:-3] + ".smiles.txt"
         if not os.path.isfile(smi_txt):
-            print(f"  WARN missing smiles index for {os.path.basename(h5f)} — skipping")
+            print(f"  WARN missing smiles index for {base} — skipping")
             continue
         with open(smi_txt, encoding="utf-8") as f:
             smis = [ln.strip() for ln in f if ln.strip()]
         with h5py.File(h5f, "r") as f:
             emb = f["mol_reps"][:]
         if len(smis) != len(emb):
-            print(f"  WARN {os.path.basename(h5f)}: {len(smis)} smiles vs {len(emb)} rows — skipping")
+            print(f"  WARN {base}: {len(smis)} smiles vs {len(emb)} rows — skipping")
             continue
-        smiles_all.extend(smis)
+
+        folds = np.linalg.norm(emb.reshape(len(emb), 6, 128), axis=2)
+        if len(emb) == 0 or float(folds.min()) < 0.9:
+            done = int((folds > 0.9).all(axis=1).sum())
+            print(f"  WARN {base}: incomplete folds ({done}/{len(emb)} rows have all 6) — skipping")
+            n_skip_fold += 1
+            continue
+
+        chunk_num = base[:-3].split("_")[-1]
+        stem = library or base.split("_drugclip_")[0]
+        ordered = _loader_row_order(os.path.join(input_dir or "", f"{stem}_chunk_{chunk_num}.csv"), smis)
+        if ordered is None:
+            print(f"  WARN {base}: cannot recover encoder row order from "
+                  f"{input_dir}/{stem}_chunk_{chunk_num}.csv — skipping")
+            n_skip_order += 1
+            continue
+
+        smiles_all.extend(ordered)
         embs_all.append(emb)
+    if n_skip_fold or n_skip_order:
+        print(f"  {n_skip_fold} chunk(s) skipped for incomplete folds, "
+              f"{n_skip_order} for unrecoverable row order")
     return smiles_all, embs_all
 
 
-def load_leaders(emb_dir, library):
+def load_leaders(emb_dir, library, input_dir=None):
     """Encoded leader molecules → (smiles->row index, M (N,6,128) float32)."""
-    smiles_all, embs_all = _load_pairs(emb_dir, library)
+    smiles_all, embs_all = _load_pairs(emb_dir, library, input_dir)
     if not embs_all:
         print(f"ERROR: no embedding h5 files in {emb_dir}")
         sys.exit(1)
@@ -77,9 +135,9 @@ def load_leaders(emb_dir, library):
     return smi2idx, M
 
 
-def load_background(bg_dir, library, sample):
+def load_background(bg_dir, library, sample, input_dir=None):
     """Background embeddings (N,6,128) for the z-score, optionally random-sampled to `sample`."""
-    _, embs_all = _load_pairs(bg_dir, library)
+    _, embs_all = _load_pairs(bg_dir, library, input_dir)
     if not embs_all:
         print(f"ERROR: no background embeddings in {bg_dir}")
         sys.exit(1)
@@ -88,6 +146,41 @@ def load_background(bg_dir, library, sample):
         rng = np.random.default_rng(0)
         M = M[rng.choice(M.shape[0], size=sample, replace=False)]
     return M
+
+
+def load_pocket_groups(pockets_index):
+    """pockets_index.csv → {screen_dir: {uniprot, domain, pocket, leader_csv, keys[...]}}.
+
+    One CSV row per (pocket x conformation), so `keys` collects the conformations.
+    """
+    groups = {}
+    with open(pockets_index, newline="") as f:
+        for row in csv.DictReader(f):
+            sd = row["screen_dir"]
+            g = groups.setdefault(sd, {
+                "uniprot": row["uniprot"], "domain": row["domain"],
+                "pocket": row["pocket"], "leader_csv": row["leader_csv"], "keys": [],
+            })
+            g["keys"].append(row["pocket_key"])
+    return groups
+
+
+def load_pocket_reps(targets_base, uniprot, cache):
+    """(names, name2idx, reps (n_conf,6,128) float32) for a target, memoized in `cache`.
+
+    Returns None if the target has no pocket_reps.pkl. `reps` is per-fold unit-norm —
+    do NOT renormalize.
+    """
+    if uniprot not in cache:
+        pkl_path = os.path.join(targets_base, uniprot, "pockets", "pocket_reps.pkl")
+        if not os.path.isfile(pkl_path):
+            cache[uniprot] = None
+        else:
+            with open(pkl_path, "rb") as f:
+                names, reps = pickle.load(f)
+            cache[uniprot] = (list(names), {n: i for i, n in enumerate(names)},
+                              np.asarray(reps, dtype=np.float32))
+    return cache[uniprot]
 
 
 def rankdata_desc(values):
@@ -121,6 +214,9 @@ def main():
     ap.add_argument("--targets-base", default="/fsx/input/targets")
     ap.add_argument("--emb-dir", default="/fsx/output/validation_leaders/drugclip")
     ap.add_argument("--library", default="validation_leaders")
+    ap.add_argument("--input-dir", default="/fsx/input/validation_leaders",
+                    help="Holds <library>_chunk_NNN.csv — needed to undo the encoder's "
+                         "lexicographic row order (see _loader_row_order).")
     ap.add_argument("--out-dir", default="/fsx/output/validation_leaders/validation")
     ap.add_argument("--background-emb-dir", default=None,
                     help="Embeddings dir for the z-score background (default: the leader union).")
@@ -133,26 +229,19 @@ def main():
     csv.field_size_limit(10 * 1024 * 1024)
 
     print("Loading leader (scored) molecule embeddings ...")
-    smi2idx, M = load_leaders(args.emb_dir, args.library)
+    smi2idx, M = load_leaders(args.emb_dir, args.library, args.input_dir)
     print(f"  {M.shape[0]} molecules, shape {M.shape}")
 
     if args.background_emb_dir:
         print(f"Loading z-score background from {args.background_emb_dir} ...")
-        M_bg = load_background(args.background_emb_dir, args.background_library, args.background_sample)
+        M_bg = load_background(args.background_emb_dir, args.background_library,
+                               args.background_sample)
         print(f"  background: {M_bg.shape[0]} molecules")
     else:
         M_bg = M
         print(f"  z-score background = leader union ({M_bg.shape[0]} molecules)")
 
-    groups = {}
-    with open(args.pockets_index, newline="") as f:
-        for row in csv.DictReader(f):
-            sd = row["screen_dir"]
-            g = groups.setdefault(sd, {
-                "uniprot": row["uniprot"], "domain": row["domain"],
-                "pocket": row["pocket"], "leader_csv": row["leader_csv"], "keys": [],
-            })
-            g["keys"].append(row["pocket_key"])
+    groups = load_pocket_groups(args.pockets_index)
 
     os.makedirs(args.out_dir, exist_ok=True)
     pkl_cache = {}
@@ -160,20 +249,14 @@ def main():
 
     for sd, g in sorted(groups.items()):
         uni = g["uniprot"]
-        if uni not in pkl_cache:
-            pkl_path = os.path.join(args.targets_base, uni, "pockets", "pocket_reps.pkl")
-            if not os.path.isfile(pkl_path):
+        seen = uni in pkl_cache
+        entry = load_pocket_reps(args.targets_base, uni, pkl_cache)
+        if entry is None:
+            if not seen:
                 print(f"  SKIP {sd}: no pocket_reps.pkl for {uni}")
-                pkl_cache[uni] = None
-            else:
-                with open(pkl_path, "rb") as f:
-                    names, reps = pickle.load(f)
-                pkl_cache[uni] = (list(names), {n: i for i, n in enumerate(names)},
-                                  np.asarray(reps, dtype=np.float32))
-        if pkl_cache[uni] is None:
             n_skip += 1
             continue
-        names, name2idx, reps = pkl_cache[uni]
+        names, name2idx, reps = entry
 
         conf_idx = [name2idx[k] for k in g["keys"] if k in name2idx]
         missing = [k for k in g["keys"] if k not in name2idx]

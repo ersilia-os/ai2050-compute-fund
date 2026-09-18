@@ -1,10 +1,16 @@
 #!/bin/bash
-# Master orchestrator for the DrugCLIP score validation (run on the head node).
+# Master orchestrator for the DrugCLIP validation (run on the head node).
 #
-# Chains every CLUSTER step (the plot is run separately on the laptop):
+# Chains every CLUSTER step (the plots are run separately on the laptop):
 #   1. prepare_validation_mols.py  → molecule chunks + pockets_index.csv
 #   2. submit-drugclip.sh          → encode the leader SMILES (array job, gpu-queue)
-#   3. dependent job (afterok)     → score_validation.py + compare_validation.py + push to S3
+#   3. dependent job (afterok)     → score + compare + ENRICHMENT + push to S3
+#
+# The headline analysis is the ENRICHMENT one (enrichment_validation.py): the paper's
+# absolute z-scores are not reproducible with a 36k background instead of their 500M
+# library, but the per-pocket RANKING is — so we ask whether each target's own leader
+# molecules float to the top of the pooled deck. The older score/compare step is kept
+# because it costs nothing and its per-pocket scores.csv is still useful.
 #
 # The pocket side is reused as-is (existing /fsx/input/targets/<ID>/pockets/pocket_reps.pkl);
 # nothing about the pockets is re-encoded here.
@@ -12,9 +18,16 @@
 # Usage:
 #   bash run-validation.sh [scope=pilot] [queue=gpu-queue]
 # Examples:
-#   bash run-validation.sh pilot            # P00519 (or $PILOT_TARGETS) only
-#   bash run-validation.sh all              # every pocket whose target is encoded
+#   bash run-validation.sh pilot            # P00519 (or $PILOT_TARGETS) only, NO enrichment
+#   bash run-validation.sh all              # encode the full deck, then score + enrich
+#   bash run-validation.sh rescore          # re-run score + compare + enrich on existing embeddings
+#   bash run-validation.sh enrich           # re-run ONLY the enrichment (fast iteration, ~3 min)
 #   PILOT_TARGETS="P00519,O14757" bash run-validation.sh pilot
+#   EF_FRACTIONS=0.005,0.01,0.02,0.05 bash run-validation.sh enrich
+#   CENTER_MOLECULES=1 VAL_TAG=centered bash run-validation.sh enrich   # hubness correction
+#
+# Enrichment needs the FULL deck — every other target's leaders are the decoys — so it is
+# skipped for scope=pilot and enrichment_validation.py refuses a too-small index anyway.
 
 set -uo pipefail
 
@@ -42,6 +55,37 @@ SUMMARY_CSV="${OUTPUT_DIR}/validation_summary${VAL_TAG:+_${VAL_TAG}}.csv"
 S3_VAL="s3://${S3_BUCKET}/output/${LIBRARY}/validation${VAL_TAG:+_${VAL_TAG}}"
 S3_SUMMARY="s3://${S3_BUCKET}/output/${LIBRARY}/validation_summary${VAL_TAG:+_${VAL_TAG}}.csv"
 
+ENR_DIR="${OUTPUT_DIR}/enrichment${VAL_TAG:+_${VAL_TAG}}"
+S3_ENR="s3://${S3_BUCKET}/output/${LIBRARY}/enrichment${VAL_TAG:+_${VAL_TAG}}"
+EF_FRACTIONS="${EF_FRACTIONS:-0.01,0.05,0.10}"
+BEDROC_ALPHAS="${BEDROC_ALPHAS:-20,80.5}"
+N_SHUFFLES="${N_SHUFFLES:-5}"
+
+# CENTER_MOLECULES=1 subtracts each molecule's mean score across targets before ranking,
+# cancelling the hubness that lets a shared pool of molecules monopolise the top of every
+# pocket's ranking. Pair it with VAL_TAG to keep centred and uncentred results side by side.
+CENTER_FLAG=""
+[ "${CENTER_MOLECULES:-0}" != "0" ] && CENTER_FLAG="--center-molecules"
+
+# DECOY_LIBRARY=<name> appends that encoded library to the deck as decoys (e.g. a ChEMBL
+# subset), instead of relying on the other targets' leaders. Decoys are never labelled active.
+DECOY_FLAGS=""
+if [ -n "${DECOY_LIBRARY:-}" ]; then
+    DECOY_FLAGS="--decoy-library ${DECOY_LIBRARY} \
+        --decoy-emb-dir ${DECOY_EMB_DIR:-/fsx/output/${DECOY_LIBRARY}/drugclip} \
+        --decoy-input-dir ${DECOY_INPUT_DIR:-/fsx/input/${DECOY_LIBRARY}}"
+fi
+
+# Expanded on the head node at submit time, like the other --wrap payloads.
+enrich_cmd() {
+    echo "$PY ${SCRIPT_DIR}/enrichment_validation.py \
+        --pockets-index ${INPUT_DIR}/pockets_index.csv \
+        --targets-base ${TARGETS_BASE} --emb-dir ${EMB_DIR} --library ${LIBRARY} \
+        --input-dir ${INPUT_DIR} \
+        --out-dir ${ENR_DIR} --ef-fractions ${EF_FRACTIONS} --bedroc-alphas ${BEDROC_ALPHAS} \
+        --n-shuffles ${N_SHUFFLES} --dump-npz ${CENTER_FLAG} ${DECOY_FLAGS}"
+}
+
 echo "=========================================="
 echo "DrugCLIP validation — master orchestrator"
 echo "=========================================="
@@ -52,31 +96,47 @@ echo "Pockets : $TARGETS_BASE"
 echo "Out tag : ${VAL_TAG:-<none>}  → $(basename "$VAL_DIR")"
 echo "=========================================="
 
-# ── rescore mode: re-run ONLY score+compare on existing embeddings, via the queue ──
+# ── rescore / enrich: re-run the ANALYSIS on existing embeddings, via the queue ──
 # (no prep, no re-encode, no head-node compute — just an sbatch job)
-if [ "$SCOPE" = "rescore" ]; then
+#   rescore → score + compare + enrichment
+#   enrich  → enrichment only; this is the loop to iterate the analysis in, ~3 min a turn
+if [ "$SCOPE" = "rescore" ] || [ "$SCOPE" = "enrich" ]; then
     [ -f "${INPUT_DIR}/pockets_index.csv" ] || {
         echo "ERROR: ${INPUT_DIR}/pockets_index.csv missing — run a normal scope (pilot/all) first"; exit 1; }
     ls "${EMB_DIR}/${LIBRARY}_drugclip_"*.h5 >/dev/null 2>&1 || {
         echo "ERROR: no embeddings in ${EMB_DIR} — run a normal scope first"; exit 1; }
     mkdir -p /shared/logs
-    RS_ID=$(sbatch \
-        --partition="$QUEUE" --job-name="drugclip-validate" --nodes=1 --time=4:00:00 \
-        --output=/shared/logs/drugclip-validate-%j.out --error=/shared/logs/drugclip-validate-%j.err \
-        --wrap="set -e; \
+
+    # The analysis is CPU-bound BLAS: give it threads or the GEMMs are the bottleneck.
+    PRE="set -e; export PYTHONDONTWRITEBYTECODE=1; export OMP_NUM_THREADS=\${SLURM_CPUS_PER_TASK:-8}"
+    if [ "$SCOPE" = "enrich" ]; then
+        JOB=drugclip-enrich
+        WRAP="${PRE}; $(enrich_cmd); aws s3 sync ${ENR_DIR} ${S3_ENR}/ --no-progress"
+    else
+        JOB=drugclip-validate
+        WRAP="${PRE}; \
             $PY ${SCRIPT_DIR}/score_validation.py --pockets-index ${INPUT_DIR}/pockets_index.csv \
-                --targets-base ${TARGETS_BASE} --emb-dir ${EMB_DIR} --library ${LIBRARY} --out-dir ${VAL_DIR}; \
+                --targets-base ${TARGETS_BASE} --emb-dir ${EMB_DIR} --library ${LIBRARY} --input-dir ${INPUT_DIR} --out-dir ${VAL_DIR}; \
             $PY ${SCRIPT_DIR}/compare_validation.py --scores-dir ${VAL_DIR} \
                 --out ${SUMMARY_CSV}; \
+            $(enrich_cmd); \
             aws s3 sync ${VAL_DIR} ${S3_VAL}/ --no-progress; \
-            aws s3 cp ${SUMMARY_CSV} ${S3_SUMMARY}" \
+            aws s3 cp ${SUMMARY_CSV} ${S3_SUMMARY}; \
+            aws s3 sync ${ENR_DIR} ${S3_ENR}/ --no-progress"
+    fi
+
+    RS_ID=$(sbatch \
+        --partition="$QUEUE" --job-name="$JOB" --nodes=1 --cpus-per-task=8 --time=4:00:00 \
+        --output=/shared/logs/${JOB}-%j.out --error=/shared/logs/${JOB}-%j.err \
+        --wrap="$WRAP" \
         2>&1 | grep -oP 'Submitted batch job \K\d+')
-    [ -n "$RS_ID" ] || { echo "ERROR: rescore submission failed"; exit 1; }
-    echo "Submitted rescore job ${RS_ID} on ${QUEUE} (score + compare, existing embeddings)."
+    [ -n "$RS_ID" ] || { echo "ERROR: ${SCOPE} submission failed"; exit 1; }
+    echo "Submitted ${SCOPE} job ${RS_ID} on ${QUEUE} (existing embeddings)."
     echo "  Pockets : ${TARGETS_BASE}"
-    echo "  Monitor : squeue -u \$USER | grep drugclip-validate"
-    echo "  Log     : tail -f /shared/logs/drugclip-validate-${RS_ID}.out"
-    echo "  Result  : cat ${SUMMARY_CSV}   (when done)"
+    echo "  Monitor : squeue -u \$USER | grep ${JOB}"
+    echo "  Log     : tail -f /shared/logs/${JOB}-${RS_ID}.out"
+    echo "  Result  : ${ENR_DIR}/enrichment_pockets.csv  (+ _targets, _controls, _summary)"
+    [ "$SCOPE" = "rescore" ] && echo "            ${SUMMARY_CSV}"
     exit 0
 fi
 
@@ -134,19 +194,32 @@ ENCODE_IDS=$(echo "$SUBMIT_OUT" | grep -oP 'Submitted job \K\d+' | paste -sd: -)
 echo ""
 echo "[3/3] Submitting dependent scoring job (afterok:${ENCODE_IDS}) ..."
 mkdir -p /shared/logs
+
+# Enrichment only makes sense on the full deck: with scope=pilot the "decoys" would be a
+# handful of leaders from one target. (enrichment_validation.py refuses it too.)
+ENRICH_STEP=""
+if [ "$SCOPE" = "all" ]; then
+    ENRICH_STEP="$(enrich_cmd); aws s3 sync ${ENR_DIR} ${S3_ENR}/ --no-progress;"
+else
+    echo "      (scope=${SCOPE}: enrichment skipped — it needs the full deck)"
+fi
+
 SCORE_ID=$(sbatch \
     --partition="$QUEUE" \
     --job-name="drugclip-validate" \
     --nodes=1 \
+    --cpus-per-task=8 \
     --time=4:00:00 \
     --dependency=afterok:"${ENCODE_IDS}" \
     --output=/shared/logs/drugclip-validate-%j.out \
     --error=/shared/logs/drugclip-validate-%j.err \
-    --wrap="set -e; \
+    --wrap="set -e; export PYTHONDONTWRITEBYTECODE=1; \
+        export OMP_NUM_THREADS=\${SLURM_CPUS_PER_TASK:-8}; \
         $PY ${SCRIPT_DIR}/score_validation.py --pockets-index ${INPUT_DIR}/pockets_index.csv \
-            --targets-base ${TARGETS_BASE} --emb-dir ${EMB_DIR} --library ${LIBRARY} --out-dir ${VAL_DIR}; \
+            --targets-base ${TARGETS_BASE} --emb-dir ${EMB_DIR} --library ${LIBRARY} --input-dir ${INPUT_DIR} --out-dir ${VAL_DIR}; \
         $PY ${SCRIPT_DIR}/compare_validation.py --scores-dir ${VAL_DIR} \
             --out ${SUMMARY_CSV}; \
+        ${ENRICH_STEP} \
         aws s3 sync ${VAL_DIR} ${S3_VAL}/ --no-progress; \
         aws s3 cp ${SUMMARY_CSV} ${S3_SUMMARY}" \
     2>&1 | grep -oP 'Submitted batch job \K\d+')
@@ -159,8 +232,19 @@ echo "Monitor : watch -n 15 'squeue -u \$USER'"
 echo "Logs    : tail -f /shared/logs/drugclip-validate-${SCORE_ID}.out"
 echo "Results : ${VAL_DIR}/<pocket>/scores.csv  +  ${SUMMARY_CSV}"
 echo "          (also pushed to ${S3_VAL}/)"
+if [ "$SCOPE" = "all" ]; then
+echo "Enrich  : ${ENR_DIR}/enrichment_pockets.csv  (+ _targets, _controls, _summary)"
+echo "          (also pushed to ${S3_ENR}/)"
+fi
+echo ""
+echo "Iterate on the analysis without re-encoding:"
+echo "  bash ${BASH_SOURCE[0]} enrich"
 echo ""
 echo "Then plot locally:"
 echo "  aws s3 sync ${S3_VAL}/ ./validation_out/"
 echo "  python scripts/drugclip_scripts/validation/plot_validation.py ./validation_out/"
+if [ "$SCOPE" = "all" ]; then
+echo "  aws s3 sync ${S3_ENR}/ ./enrichment_out/"
+echo "  python scripts/drugclip_scripts/validation/plot_enrichment.py ./enrichment_out/"
+fi
 echo "=========================================="
