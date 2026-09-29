@@ -16,13 +16,16 @@ template below are adapted as stated here. This section wins where the two disag
 - `scripts/large_library_scripts/`: billion-scale wave pipeline, ID tagging, dedup.
 - `scripts/AWS_templates/`: VPC template, cluster configs, bootstrap and job scripts.
 - `scripts/singularity_job_scripts/`: the same job toolkit for Singularity models.
+- `scripts/batch_job_scripts/`: the same toolkit for the fixed `batch_inputs` set
+  (`/fsx/input/batch_inputs/smiles_NNN.csv`), plus FSx/S3 housekeeping:
+  `sync-models-to-s3.sh` (sync, optional `--cleanup`) and `verify-fsx-in-s3.sh` (read-only audit).
 - `scripts/drugclip_scripts/`: DrugCLIP encoding, `validation/`, `pocket_rebuild/`.
 - `docs/`: numbered public write-ups (`NN_topic.md`): cluster guides and short TL;DRs of each
   work stream, written for colleagues. Folder READMEs under `scripts/` are run guides only.
 - `docs/claude_sessions/` (gitignored): detailed session notes, handoffs and findings logs for
   Claude, named `YYYY-MM-DD_topic.md`. Read the relevant one before resuming a work stream, and
   write new detail here rather than in the public docs.
-- Gitignored, local only: `scripts/batch_job_scripts/`, `scripts/transfer/`, and
+- Gitignored, local only: `scripts/transfer/` and
   `Drug-The-Whole-Genome/` (a clone of the upstream DrugCLIP repository).
 
 ### Deviations from the template
