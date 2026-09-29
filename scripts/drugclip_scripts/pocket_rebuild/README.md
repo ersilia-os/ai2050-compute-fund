@@ -5,7 +5,8 @@ that already exists** — no script under `scripts/drugclip_scripts/` is edited,
 existing pocket set or result directory is written to. The originals are copied and adapted
 so the current `/fsx/input/targets` set stays exactly reproducible.
 
-See [FINDINGS.md](FINDINGS.md) for measured results. See the approved plan at
+See [docs/05_drugclip_validation.md](../../../docs/05_drugclip_validation.md)
+for the result. See the approved plan at
 `~/.claude/plans/i-think-that-one-iterative-knuth.md` for the reasoning.
 
 ## The problem in one paragraph

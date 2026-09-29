@@ -8,11 +8,11 @@ untouched and still handle the five smaller libraries.
 
 | Step | Script | Role |
 |------|--------|------|
-| 01 | `01_large_library_processing.py` | Stream the giant file → 100k-row SMILES chunks + sharded gzip raw-SMILES→ID map |
+| 01 | `../library_processing/01_large_library_processing.py` | Stream the giant file → 100k-row SMILES chunks + sharded gzip raw-SMILES→ID map |
 | 1.5 | `submit-ersilia-waves.sh` + `run-ersilia-wave-job.sh` | Run the standardization model over all ~14,100 chunks in FSx-bounded waves; results → S3 |
 | 2a | `submit-tag-ids.sh` + `run-tag-ids-job.sh` + `join_ids.py` | **On cluster**: re-attach the collection id to each standardized SMILES → gzip *tagged* shards in S3 |
 | 2b | `dedup_and_map.py` | **Local**: dedup standardized SMILES (keep first) → **final `standardized_smiles→id` map** + deduped input chunks |
-| 01b | `prepare-h3d-selected-library.sh` | Ingest a *selected* subset (`key,input` gzip) as its own library — step 01 only, no restandardization |
+| 01b | `../library_processing/prepare-h3d-selected-library.sh` | Ingest a *selected* subset (`key,input` gzip) as its own library — step 01 only, no restandardization |
 
 The end-to-end path is **01 → 1.5 (standardize) → 2a (tag) → 2b (dedup + map)**, then
 run downstream models on the deduplicated set. Standardization runs via the **wave
@@ -60,7 +60,7 @@ Runs wherever the raw file lives (local box or head node). Streams the file, nev
 loads it into RAM, never fully decompresses to disk.
 
 ```bash
-python 01_large_library_processing.py \
+python ../library_processing/01_large_library_processing.py \
   --input  /path/2026.01_Enamine_REAL_DB_1.4B.cxsmiles.bz2 \
   --output-dir ./output \
   --library-name Enamine_Real_Sample_1.4B \
@@ -197,10 +197,10 @@ the header; the run aborts early if the header can't be read.
 
 ```bash
 # smoke test first (throwaway output dir, no upload, works on a partial download)
-LIMIT=200000 ./prepare-h3d-selected-library.sh ~/h3d_selected_100M.csv.gz ./smoke
+LIMIT=200000 ../library_processing/prepare-h3d-selected-library.sh ~/h3d_selected_100M.csv.gz ./smoke
 
 # full run — 100M @ 50k/chunk = ~2,000 chunks, uploads chunks + id shards to S3
-./prepare-h3d-selected-library.sh ~/h3d_selected_100M.csv.gz ./output
+../library_processing/prepare-h3d-selected-library.sh ~/h3d_selected_100M.csv.gz ./output
 ```
 
 Defaults: `LIB=Enamine_Real_h3d_selected`, `CHUNK_SIZE=50000`. Override any of
@@ -214,7 +214,7 @@ wrapper builds any selected subset. Libraries built so far:
 
 ```bash
 LIB=Enamine_Real_h3d_selected_1M CHUNK_SIZE=1000 \
-  ./prepare-h3d-selected-library.sh ~/Downloads/44_key_input_1M.csv.gz ./output
+  ../library_processing/prepare-h3d-selected-library.sh ~/Downloads/44_key_input_1M.csv.gz ./output
 ```
 
 **Choosing a chunk size.** Every job pays a fixed container+model startup before its

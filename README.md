@@ -1,106 +1,56 @@
-# AI2050 Compute Fund
+# Running Ersilia models and DrugCLIP screening over billion-scale chemical libraries
 
-This repository contains workflows and infrastructure templates for large-scale chemical library processing with Ersilia models on AWS ParallelCluster.
+![Status](https://img.shields.io/badge/status-in%20progress-orange)
 
-It currently covers two main areas:
+This repository holds the compute work for Ersilia's AI2050 project: running Ersilia Model Hub
+models, and DrugCLIP virtual screening, over commercial and natural-product libraries from
+hundreds of thousands to 1.4 billion molecules, on an AWS ParallelCluster (Slurm) cluster.
 
-1. Chemical library preprocessing into model-ready SMILES chunks.
-2. AWS ParallelCluster templates and operational guides for batch inference at scale.
+## What is here
 
-## Repository Contents
+- **Library processing:** vendor files to model-ready SMILES chunks, re-chunking after
+  standardization, and debugging failing chunks.
+  [`scripts/library_processing/`](scripts/library_processing/README.md)
+- **Billion-scale pipeline:** Enamine REAL 1.4B in FSx-bounded waves, with ID tagging and
+  deduplication. [`scripts/large_library_scripts/`](scripts/large_library_scripts/README.md)
+- **Cluster infrastructure and job toolkits:** VPC template, cluster configs, bootstrap
+  scripts, and the submit/check/resubmit/bisect/merge scripts for Ersilia and Singularity
+  models. [`scripts/AWS_templates/`](scripts/AWS_templates/),
+  [`scripts/singularity_job_scripts/`](scripts/singularity_job_scripts/)
+- **DrugCLIP screening:** molecule and pocket encoding for 66 human targets, and the
+  enrichment validation against the paper's leaderboards.
+  [`scripts/drugclip_scripts/`](scripts/drugclip_scripts/)
 
-```text
-AI2050-Compute-Fund/
-├── scripts/
-│   ├── 01_chemical_libraries_processing.py
-│   ├── CHEMICAL_LIRARIES.md
-│   └── AWS_templates/
-│       ├── hpc_vpc_template.yaml
-│       ├── cluster-config.yaml
-│       ├── bootstrap-head-simplified.sh
-│       ├── bootstrap-compute-simplified.sh
-│       ├── check-results.sh
-│       ├── PRE_DEPLOYMENT_CHECKLIST.md
-│       ├── CLUSTER_DETAILS.md
-│       └── CLUSTER_USAGE_HOWTO.md
-├── assets/
-├── README.md
-└── LICENSE
-```
+Queueing many model runs on the cluster is handled by the separate
+[model-launcher](https://github.com/ersilia-os/model-launcher) repository.
 
-## Chemical Library Processing
+## Getting started
 
-The script [`scripts/01_chemical_libraries_processing.py`](scripts/01_chemical_libraries_processing.py) extracts SMILES and compound IDs from supported public datasets and writes:
-
-1. Chunked CSV files with one `smiles` column (10,000 rows per chunk).
-2. A full `<library_name>_smiles_ids.csv` file with `smiles` and `collection_id`.
-
-### Supported input files
-
-- `Enamine_Hit_Locator_Library_plated.zip`
-- `Enamine_Liquid-Stock-Collection-US.zip`
-- `Molport_Screening_Compound_Database.zip`
-- `coconut_csv-02-2026.zip`
-- `2025.02_Enamine_REAL_DB_10.4M.cxsmiles.bz2`
-
-### Usage
+Set up or reach the cluster with the guides in [`docs/`](docs/): the
+[deployment checklist](docs/01_cluster_deployment_checklist.md),
+[cluster details](docs/02_cluster_details.md) and [usage guide](docs/03_cluster_usage.md).
+Scripts are deployed to `/shared/scripts/` on the head node and run there.
 
 ```bash
-# Process all configured libraries from a directory
-python scripts/01_chemical_libraries_processing.py \
-  --input-dir ./raw \
-  --output-dir ./output
+# locally: build chunks, then upload them to s3://ai2050-ersilia-cluster/input/<library>/
+python scripts/library_processing/01_chemical_libraries_processing.py --input-dir ./raw --output-dir ./output
 
-# Process selected files only
-python scripts/01_chemical_libraries_processing.py \
-  --input-dir ./raw \
-  --output-dir ./output \
-  --files coconut_csv-02-2026.zip Enamine_Hit_Locator_Library_plated.zip
+# head node: run an Ersilia model over a library, or DrugCLIP on the GPU queue
+/shared/scripts/submit-ersilia-batch.sh <model_id> <library_name> cpu-queue
+bash /shared/scripts/drugclip_scripts/submit-drugclip.sh <library_name> gpu-queue
 ```
 
-### Output layout
+## Outputs
 
-```text
-output/
-└── <library_name>/
-    ├── <library_name>_chunk_000.csv
-    ├── <library_name>_chunk_001.csv
-    ├── ...
-    └── <library_name>_smiles_ids.csv
-```
+Model results land in `/fsx/output/<library>/<model_id>/` and are synced to
+`s3://ai2050-ersilia-cluster/output/`. Results pulled locally go in `output/`, which is tracked
+by eosvc, not git. Findings and decision logs are in [`docs/`](docs/); the DrugCLIP validation
+result is in [`docs/05_drugclip_validation.md`](docs/05_drugclip_validation.md).
 
-More details: [`scripts/CHEMICAL_LIRARIES.md`](scripts/CHEMICAL_LIRARIES.md)
+The repository layout and conventions are described in [`CLAUDE.md`](CLAUDE.md).
 
-## AWS ParallelCluster Templates
+## About the Ersilia Open Source Initiative
 
-Cluster infrastructure and operating docs are under [`scripts/AWS_templates/`](scripts/AWS_templates/).
-
-### Key files
-
-- VPC stack template: `hpc_vpc_template.yaml`
-- Cluster config: `cluster-config.yaml`
-- Bootstrap scripts: `bootstrap-head-simplified.sh`, `bootstrap-compute-simplified.sh`
-- Results validation: `check-results.sh`
-- Deployment checklist: `PRE_DEPLOYMENT_CHECKLIST.md`
-- Operations guides: `CLUSTER_DETAILS.md`, `CLUSTER_USAGE_HOWTO.md`
-
-### Typical flow
-
-1. Validate prerequisites with `PRE_DEPLOYMENT_CHECKLIST.md`.
-2. Provision networking (VPC/subnets/endpoints/security groups).
-3. Deploy ParallelCluster with `cluster-config.yaml`.
-4. Upload SIF models and input chunks to S3.
-5. Submit jobs from the head node and monitor with Slurm.
-6. Merge outputs and sync results back from S3.
-
-## Notes
-
-- `requirements.txt` is currently empty because the chemical processing script uses Python standard library modules only.
-- `install.sh` is currently empty.
-- Some docs include environment-specific IDs (VPC/subnet/security group, bucket names). Update them before reuse.
-
-## About Ersilia
-
-The [Ersilia Open Source Initiative](https://ersilia.io) builds open tools for AI-enabled drug discovery, with a focus on enabling research in low-resource settings.
+The [Ersilia Open Source Initiative](https://ersilia.io) is a tech-nonprofit organization fueling sustainable research in the Global South. Ersilia's main asset is the [Ersilia Model Hub](https://github.com/ersilia-os/ersilia), an open-source repository of AI/ML models for antimicrobial drug discovery.
 
 ![Ersilia Logo](assets/Ersilia_Brand.png)

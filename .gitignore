@@ -12,6 +12,7 @@ tmp/
 .DS_Store
 .vscode/
 scripts/transfer/
+docs/claude_sessions/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

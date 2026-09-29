@@ -3,9 +3,9 @@
 Large single-file chemical library processing (billion-scale).
 ==============================================================
 Dedicated ingestion step for a VERY large single compressed library file
-(e.g. the 1.41B-molecule Enamine REAL sample), sized ~135x the 10.4M sample.
+(e.g. the 1.4B-molecule Enamine REAL sample), sized ~135x the 10.4M sample.
 
-It is the billion-scale counterpart of ../01_chemical_libraries_processing.py.
+It is the billion-scale counterpart of 01_chemical_libraries_processing.py (same folder).
 The original script is left untouched and still handles the 5 smaller libraries.
 
 What it does
@@ -17,7 +17,7 @@ decompressed to disk) and writes, for a chosen library:
   <output-dir>/<library>/smiles_ids/<library>_smiles_ids_NNNNNN.csv.gz
                                                               smiles + collection_id (gzip), one per chunk
 
-Design choices for billion-scale (see large_library_scripts/README.md)
+Design choices for billion-scale (see ../large_library_scripts/README.md)
 ----------------------------------------------------------------------
   * Streaming decompression. Prefers an external decompressor (lbzip2 / pbzip2
     / bzip2 for .bz2; pigz / gzip for .gz) piped via subprocess so decompression
@@ -42,9 +42,9 @@ Usage
 -----
   # Full run (bz2 auto-detected from extension)
   python 01_large_library_processing.py \
-      --input /path/2025.02_Enamine_REAL_DB_1.41B.cxsmiles.bz2 \
+      --input /path/2026.01_Enamine_REAL_DB_1.4B.cxsmiles.bz2 \
       --output-dir ./output \
-      --library-name Enamine_Real_Sample_1.41B
+      --library-name Enamine_Real_Sample_1.4B
 
   # Quick sanity test on the first 500k molecules only
   python 01_large_library_processing.py --input FILE --limit 500000
