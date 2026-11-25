@@ -2,6 +2,7 @@
 #SBATCH --job-name=drugclip
 #SBATCH --partition=gpu-queue
 #SBATCH --nodes=1
+#SBATCH --exclusive
 #SBATCH --time=2-00:00:00
 #SBATCH --output=/shared/logs/drugclip-%A_%a.out
 #SBATCH --error=/shared/logs/drugclip-%A_%a.err
@@ -35,6 +36,14 @@ fi
 SIF_FILE="/shared/sif-files/drugclip.sif"
 WEIGHTS_DIR="/shared/drugclip-weights"
 OUTPUT_BASE="/fsx/output/${LIBRARY_NAME}/drugclip"
+MOL_BATCH_SIZE=${MOL_BATCH_SIZE:-256}
+# Step 1 runs the smiles_to_lmdb.py deployed in /shared, NOT the April copy baked into the
+# image at /drugclip/: the /shared one skips molecules the encoder cannot take (>=512 heavy
+# atoms, which otherwise kill the whole chunk), caps each molecule's 3D generation at
+# RDKIT_TIMEOUT seconds, runs it in parallel, and writes <chunk>.skipped.csv. Same RDKit
+# calls, seed and LMDB keys as before, so molecules that encoded before encode identically.
+LMDB_SCRIPT=${LMDB_SCRIPT:-/shared/scripts/drugclip_scripts/smiles_to_lmdb.py}
+RDKIT_TIMEOUT=${RDKIT_TIMEOUT:-60}
 
 # ── Pick input file by array index ───────────────────────────────────────────
 INPUT_FILE=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "$CHUNK_LIST")
@@ -81,6 +90,11 @@ if [ ! -f "$INPUT_FILE" ]; then
     exit 1
 fi
 
+if [ ! -f "$LMDB_SCRIPT" ]; then
+    echo "ERROR: smiles_to_lmdb.py not found: $LMDB_SCRIPT"
+    exit 1
+fi
+
 mkdir -p "$OUTPUT_BASE"
 
 # ── GPU/CPU detection ─────────────────────────────────────────────────────────
@@ -106,6 +120,7 @@ echo ""
 echo "Step 1/2 — Converting SMILES CSV → LMDB ..."
 echo "  Input : $INPUT_FILE"
 echo "  Output: $LMDB_PATH"
+echo "  Script: $LMDB_SCRIPT  (3D timeout ${RDKIT_TIMEOUT} s/molecule)"
 
 apptainer exec \
     $NV_FLAG \
@@ -113,9 +128,10 @@ apptainer exec \
     --bind /shared:/shared \
     --bind "${TMP_DIR}:${TMP_DIR}" \
     "$SIF_FILE" \
-    python /drugclip/smiles_to_lmdb.py \
-        --input  "$INPUT_FILE" \
-        --output "$LMDB_PATH"
+    python "$LMDB_SCRIPT" \
+        --input   "$INPUT_FILE" \
+        --output  "$LMDB_PATH" \
+        --timeout "$RDKIT_TIMEOUT"
 
 if [ ! -d "$LMDB_PATH" ]; then
     echo "ERROR: LMDB was not created"
@@ -140,7 +156,7 @@ apptainer exec \
         --user-dir /drugclip/unimol \
         /drugclip/dict \
         --valid-subset test \
-        --num-workers 0 --ddp-backend=c10d --batch-size 256 \
+        --num-workers 0 --ddp-backend=c10d --batch-size "$MOL_BATCH_SIZE" \
         --task drugclip --loss in_batch_softmax --arch drugclip \
         --max-pocket-atoms 256 --seed 1 \
         --log-interval 100 --log-format simple \
@@ -261,6 +277,13 @@ TMP_SMILES="${LMDB_PATH%.lmdb}.smiles.txt"
 SMILES_INDEX="${OUTPUT_BASE}/${LIBRARY_NAME}_drugclip_${CHUNK_NUM}.smiles.txt"
 if [ -f "$TMP_SMILES" ]; then
     mv "$TMP_SMILES" "$SMILES_INDEX"
+fi
+
+# Keep the skip log: every molecule that becomes an empty row, and why (invalid,
+# too_large, timeout, embed_failed). Without it an empty row is unexplainable later.
+TMP_SKIPPED="${LMDB_PATH%.lmdb}.skipped.csv"
+if [ -f "$TMP_SKIPPED" ]; then
+    mv "$TMP_SKIPPED" "${OUTPUT_BASE}/${LIBRARY_NAME}_drugclip_${CHUNK_NUM}.skipped.csv"
 fi
 
 SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)

@@ -7,7 +7,7 @@
 #   merge-batch-bisect.sh <model_id> <chunk_num>
 #
 # Output:
-#   /fsx/output/batch_outputs/<model_out>_<chunk_num>.csv
+#   /fsx/output/batch_outputs/<model_id>_<chunk_num>.csv  (model_id keeps its version, e.g. eos21dr_v6)
 #   (same name and format as normal batch output — compatible with check-batch-results.sh)
 
 set -euo pipefail
@@ -21,11 +21,10 @@ if [ -z "$MODEL_ID" ] || [ -z "$CHUNK_NUM" ]; then
     exit 1
 fi
 
-MODEL_OUT=$(echo "$MODEL_ID" | sed 's/_v[0-9]*$//')
 INPUT_FILE="/fsx/input/batch_inputs/smiles_${CHUNK_NUM}.csv"
 OUTPUT_DIR="/fsx/output/batch_outputs"
 BISECT_DIR="${OUTPUT_DIR}/bisect/${MODEL_ID}/${CHUNK_NUM}"
-FINAL_OUTPUT="${OUTPUT_DIR}/${MODEL_OUT}_${CHUNK_NUM}.csv"
+FINAL_OUTPUT="${OUTPUT_DIR}/${MODEL_ID}_${CHUNK_NUM}.csv"
 
 if [ ! -f "$INPUT_FILE" ]; then
     echo "ERROR: Input file not found: $INPUT_FILE"

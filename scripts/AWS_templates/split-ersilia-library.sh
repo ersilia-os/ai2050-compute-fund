@@ -46,11 +46,8 @@ if [ ! -d "$INPUT_DIR" ]; then
     exit 1
 fi
 
-if [ ! -f "/shared/sif-files/${MODEL_ID}.sif" ]; then
-    echo "ERROR: Model SIF not found: /shared/sif-files/${MODEL_ID}.sif"
-    echo "Download it first: /shared/scripts/download-ersilia-model.sh $MODEL_ID"
-    exit 1
-fi
+# Model SIFs come only from s3://models-sif; fetched once into /shared/sif-files.
+/shared/scripts/download-ersilia-model.sh "$MODEL_ID" || exit 1
 
 mkdir -p "$OUTPUT_DIR"
 

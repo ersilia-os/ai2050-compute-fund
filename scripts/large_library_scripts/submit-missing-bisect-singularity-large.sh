@@ -119,8 +119,8 @@ fi
 for req in "$BISECT_SCRIPT" "$MERGE_SCRIPT"; do
     [ -f "$req" ] || { echo "ERROR: required script not found: $req"; exit 1; }
 done
-[ -f "/shared/sif-files/${MODEL_ID}.sif" ] || {
-    echo "ERROR: SIF not found: /shared/sif-files/${MODEL_ID}.sif"; exit 1; }
+# Model SIFs come only from s3://models-sif; fetched once into /shared/sif-files.
+/shared/scripts/download-ersilia-model.sh "$MODEL_ID" || exit 1
 
 S3_INPUT="s3://${S3_BUCKET}/input/${LIBRARY}/"
 S3_OUTPUT="s3://${S3_BUCKET}/output/${LIBRARY}/${MODEL_ID}/"

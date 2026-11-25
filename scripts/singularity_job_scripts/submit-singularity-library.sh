@@ -38,10 +38,8 @@ if [ ! -d "$INPUT_DIR" ]; then
     exit 1
 fi
 
-if [ ! -f "$SIF_FILE" ]; then
-    echo "ERROR: SIF file not found: $SIF_FILE"
-    exit 1
-fi
+# Model SIFs come only from s3://models-sif; fetched once into /shared/sif-files.
+/shared/scripts/download-ersilia-model.sh "$MODEL_ID" || exit 1
 
 mkdir -p "$OUTPUT_DIR"
 

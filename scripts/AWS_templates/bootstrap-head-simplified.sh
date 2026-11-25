@@ -64,6 +64,11 @@ chown -R ec2-user:ec2-user /shared/output
 # Create helper scripts
 # ==========================================
 
+# !! OUT OF DATE (2026-11-23): model SIFs now come only from s3://models-sif. The live
+# !! download-ersilia-model.sh, sync-sif-from-s3.sh and submit-ersilia-batch.sh are the
+# !! standalone copies in scripts/AWS_templates/. If this cluster is ever rebuilt, copy
+# !! those over /shared/scripts/ instead of trusting the heredocs below.
+
 # Script 1: Download Ersilia model (S3 ONLY - no DockerHub)
 cat > /shared/scripts/download-ersilia-model.sh << 'DOWNLOAD_SCRIPT'
 #!/bin/bash

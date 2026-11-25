@@ -54,6 +54,16 @@ if [ "$DEST_PREFIX" = "targets" ]; then
     exit 1
 fi
 
+# Guard: ai2050_targets is the MERGED set (targets_ligand + targets_mtb_v2, see its sets.csv).
+# The sync below runs with --delete, so staging one set's ligand_dir into it would strip every
+# other target's _LIG.pdb and manifest.csv. Stage and encode under a new prefix, then copy
+# the finished target folder into ai2050_targets and add its row to sets.csv.
+if [ "$DEST_PREFIX" = "ai2050_targets" ]; then
+    echo "ERROR: --dest-prefix 'ai2050_targets' is the merged pocket set and must not be staged into."
+    echo "  Stage under its own prefix, encode, then copy the target folder in by hand."
+    exit 1
+fi
+
 S3_DEST="s3://${S3_BUCKET}/input/${DEST_PREFIX}/"
 
 echo "=========================================="

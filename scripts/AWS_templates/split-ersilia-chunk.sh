@@ -32,11 +32,8 @@ SPLIT_DIR="${OUTPUT_DIR}/split/${CHUNK_NUM}"
 SIF_FILE="/shared/sif-files/${MODEL_ID}.sif"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ ! -f "$SIF_FILE" ]; then
-    echo "ERROR: SIF file not found: $SIF_FILE"
-    echo "Run: /shared/scripts/download-ersilia-model.sh $MODEL_ID"
-    exit 1
-fi
+# Model SIFs come only from s3://models-sif; fetched once into /shared/sif-files.
+/shared/scripts/download-ersilia-model.sh "$MODEL_ID" || exit 1
 
 CHUNK_FILE=$(ls "${INPUT_DIR}/"*"_chunk_${CHUNK_NUM}.csv" 2>/dev/null | head -1)
 if [ -z "$CHUNK_FILE" ]; then

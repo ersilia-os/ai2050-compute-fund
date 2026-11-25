@@ -19,8 +19,20 @@ The 182 "pocketN" pockets came from Fpocket + GenPack instead.  The paper's meth
     generated ligands are selected as the final pocket region.
 
 That generated molecule is NOT distributed -- every `complex_refined.pdbgz` in
-`screen_results.zip` has 0 HETATM -- and GenPack itself was never released (the authors'
-repo ships DrugCLIP only).  So the molecule that defined these pockets is gone.
+`screen_results.zip` has 0 HETATM.  So the molecule that defined these pockets is gone from
+the released data.
+
+CORRECTION (2026-10-01): an earlier version of this docstring added "and GenPack itself was
+never released (the authors' repo ships DrugCLIP only)".  That is wrong.  GenPack is released
+at THU-ATOM/Pocket-Detection-of-DTWG as a MolCRAFT fork (`SBDD_AUG/genpack_bfn/`,
+`sample_for_pocket.py`) with an auto-downloading checkpoint, and the ligand is missing from the
+distributed files because their `extract_pocket.py` detaches every chain but A before saving --
+it was never written, not stripped.  So the pseudoligand can be GENERATED with the authors' own
+model rather than substituted, which is the chosen route; see
+docs/claude_sessions/2026-10-01_drugclip_genpack_molcraft.md.
+
+This script remains useful as a cross-check: where both a transplanted real ligand and a
+generated one exist, they should agree, and disagreement flags a pocket worth inspecting.
 
 This script substitutes a *real* ligand for the generated one: find a PDB entry of the
 same protein (or a homolog), superpose it onto the AlphaFold conformer, and keep the

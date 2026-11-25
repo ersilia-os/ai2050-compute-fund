@@ -26,17 +26,13 @@ if [ -z "$MODEL_ID" ] || [ -z "$CHUNK_NUM" ]; then
 fi
 
 INPUT_FILE="/fsx/input/batch_inputs/smiles_${CHUNK_NUM}.csv"
-MODEL_OUT=$(echo "$MODEL_ID" | sed 's/_v[0-9]*$//')
 OUTPUT_DIR="/fsx/output/batch_outputs"
 BISECT_DIR="${OUTPUT_DIR}/bisect/${MODEL_ID}/${CHUNK_NUM}"
 SIF_FILE="/shared/sif-files/${MODEL_ID}.sif"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ ! -f "$SIF_FILE" ]; then
-    echo "ERROR: SIF file not found: $SIF_FILE"
-    echo "Run: /shared/scripts/download-ersilia-model.sh $MODEL_ID"
-    exit 1
-fi
+# Model SIFs come only from s3://models-sif; fetched once into /shared/sif-files.
+/shared/scripts/download-ersilia-model.sh "$MODEL_ID" || exit 1
 
 if [ ! -f "$INPUT_FILE" ]; then
     echo "ERROR: Input file not found: $INPUT_FILE"

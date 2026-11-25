@@ -59,6 +59,9 @@ if [ "$NUM_MISSING" -eq 0 ]; then
     exit 0
 fi
 
+# Model SIFs come only from s3://models-sif; fetched once into /shared/sif-files.
+/shared/scripts/download-ersilia-model.sh "$MODEL_ID" || exit 1
+
 echo ""
 echo "Found $NUM_MISSING chunk(s) to resubmit"
 

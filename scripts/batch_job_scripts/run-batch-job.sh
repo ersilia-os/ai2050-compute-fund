@@ -34,9 +34,8 @@ fi
 
 # Extract zero-padded chunk number from smiles_NNN.csv -> NNN
 CHUNK_NUM=$(basename "$INPUT_FILE" .csv | grep -oP '\d+$')
-# Strip version suffix (_v1, _v2, ...) from output filename
-MODEL_OUT=$(echo "$MODEL_ID" | sed 's/_v[0-9]*$//')
-OUTPUT_FILE="${OUTPUT_DIR}/${MODEL_OUT}_${CHUNK_NUM}.csv"
+# Output name keeps the version (eos21dr_v6_000.csv) so runs of different builds never overwrite each other
+OUTPUT_FILE="${OUTPUT_DIR}/${MODEL_ID}_${CHUNK_NUM}.csv"
 
 SIF_FILE="/shared/sif-files/${MODEL_ID}.sif"
 

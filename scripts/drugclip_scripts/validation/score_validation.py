@@ -67,8 +67,27 @@ def _loader_row_order(input_csv, smis):
     return [smis[o] for o in order]
 
 
+def _h5_files(emb_dir, library=None):
+    """The chunk h5 files _iter_pairs reads, in the order it reads them."""
+    pat = f"{library}_drugclip_*.h5" if library else "*_drugclip_*.h5"
+    return sorted(glob.glob(os.path.join(emb_dir, pat)))
+
+
 def _load_pairs(emb_dir, library=None, input_dir=None):
-    """Load (smiles_list, emb (N,768)) from all matching *_drugclip_*.h5 + .smiles.txt.
+    """Load (smiles_list, [emb (n,768) per chunk]) from all matching *_drugclip_*.h5.
+
+    Holds every chunk in memory at once. For a deck too large for that, iterate
+    _iter_pairs instead (screen_library.py does) -- same guards, same order.
+    """
+    smiles_all, embs_all = [], []
+    for smis, emb in _iter_pairs(emb_dir, library, input_dir):
+        smiles_all.extend(smis)
+        embs_all.append(emb)
+    return smiles_all, embs_all
+
+
+def _iter_pairs(emb_dir, library=None, input_dir=None):
+    """Yield (smiles in h5 row order, emb (n,768)) per usable chunk, one chunk at a time.
 
     Two correctness guards, both of which the raw files fail silently without:
       - rows are re-paired with SMILES in the encoder's lexicographic order (see
@@ -77,11 +96,9 @@ def _load_pairs(emb_dir, library=None, input_dir=None):
         and the encode loop fills fold-major, so a job that dies part-way leaves a
         correctly-shaped h5 whose later folds are all zero.
     """
-    pat = f"{library}_drugclip_*.h5" if library else "*_drugclip_*.h5"
-    h5_files = sorted(glob.glob(os.path.join(emb_dir, pat)))
+    h5_files = _h5_files(emb_dir, library)
     if input_dir is None and library:
         input_dir = os.path.join("/fsx/input", library)
-    smiles_all, embs_all = [], []
     n_skip_fold = n_skip_order = 0
     for h5f in h5_files:
         base = os.path.basename(h5f)
@@ -113,12 +130,10 @@ def _load_pairs(emb_dir, library=None, input_dir=None):
             n_skip_order += 1
             continue
 
-        smiles_all.extend(ordered)
-        embs_all.append(emb)
+        yield ordered, emb
     if n_skip_fold or n_skip_order:
         print(f"  {n_skip_fold} chunk(s) skipped for incomplete folds, "
               f"{n_skip_order} for unrecoverable row order")
-    return smiles_all, embs_all
 
 
 def load_leaders(emb_dir, library, input_dir=None):

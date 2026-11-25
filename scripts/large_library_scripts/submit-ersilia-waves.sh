@@ -75,11 +75,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_JOB="${SCRIPT_DIR}/run-ersilia-wave-job.sh"
 [ -f "$RUN_JOB" ] || RUN_JOB="/shared/scripts/run-ersilia-wave-job.sh"
 
-if [ ! -f "/shared/sif-files/${MODEL_ID}.sif" ]; then
-    echo "ERROR: Model SIF not found: /shared/sif-files/${MODEL_ID}.sif"
-    echo "Download it first: /shared/scripts/download-ersilia-model.sh $MODEL_ID"
-    exit 1
-fi
+# Model SIFs come only from s3://models-sif; fetched once into /shared/sif-files.
+/shared/scripts/download-ersilia-model.sh "$MODEL_ID" || exit 1
 if [ ! -f "$RUN_JOB" ]; then
     echo "ERROR: worker script not found: $RUN_JOB (deploy run-ersilia-wave-job.sh to /shared/scripts)"
     exit 1

@@ -34,7 +34,6 @@ END=$(echo "$TASK_LINE" | awk '{print $2}')
 SUB_CHUNK="${BISECT_DIR}/sub_${START}_${END}.csv"
 SUB_RESULT="${BISECT_DIR}/result_${START}_${END}.csv"
 SIF_FILE="/shared/sif-files/${MODEL_ID}.sif"
-MODEL_OUT=$(echo "$MODEL_ID" | sed 's/_v[0-9]*$//')
 NUM_MOLS=$(( END - START + 1 ))
 
 echo "=========================================="
@@ -85,7 +84,7 @@ if [ $NUM_MOLS -eq 1 ]; then
 import csv, hashlib, glob, os
 
 bisect_dir = "$BISECT_DIR"
-model_out  = "$MODEL_OUT"
+model_out  = "$MODEL_ID"
 sub_chunk  = "$SUB_CHUNK"
 sub_result = "$SUB_RESULT"
 

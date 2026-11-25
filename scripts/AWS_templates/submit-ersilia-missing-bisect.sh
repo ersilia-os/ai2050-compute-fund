@@ -139,11 +139,8 @@ for req in "$BISECT_SCRIPT" "$MERGE_SCRIPT"; do
 done
 
 SIF_FILE="/shared/sif-files/${MODEL_ID}.sif"
-if [ ! -f "$SIF_FILE" ]; then
-    echo "ERROR: SIF file not found: $SIF_FILE"
-    echo "Run: /shared/scripts/download-ersilia-model.sh $MODEL_ID"
-    exit 1
-fi
+# Model SIFs come only from s3://models-sif; fetched once into /shared/sif-files.
+/shared/scripts/download-ersilia-model.sh "$MODEL_ID" || exit 1
 
 WATCH_DIR="/fsx/output/bisect-watch/${MODEL_ID}"
 mkdir -p "$WATCH_DIR"

@@ -31,11 +31,8 @@ BISECT_DIR="${OUTPUT_DIR}/bisect/${CHUNK_NUM}"
 SIF_FILE="/shared/sif-files/${MODEL_ID}.sif"
 
 # Validate
-if [ ! -f "$SIF_FILE" ]; then
-    echo "ERROR: SIF file not found: $SIF_FILE"
-    echo "Run: /shared/scripts/download-ersilia-model.sh $MODEL_ID"
-    exit 1
-fi
+# Model SIFs come only from s3://models-sif; fetched once into /shared/sif-files.
+/shared/scripts/download-ersilia-model.sh "$MODEL_ID" || exit 1
 
 # Find the input chunk file (handles both naming conventions)
 CHUNK_FILE=$(ls "${INPUT_DIR}/"*"_chunk_${CHUNK_NUM}.csv" 2>/dev/null | head -1)

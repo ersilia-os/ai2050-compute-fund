@@ -11,7 +11,7 @@
 #
 # Example:
 #   bash check-batch-results.sh
-#   bash check-batch-results.sh eos1af5 eos1pu1
+#   bash check-batch-results.sh eos1af5_v1 eos1pu1_v1
 
 INPUT_DIR="/fsx/input/batch_inputs"
 OUTPUT_DIR="/fsx/output/batch_outputs"
@@ -31,18 +31,18 @@ if [ $# -gt 0 ]; then
     MODELS=("$@")
 else
     # Discover model IDs from files named <model_id>_NNN.csv
-    # Model IDs match: eosXXXX (letters+digits), followed by _NNN.csv
+    # Model IDs match eosXXXX or eosXXXX_vN (new runs keep the version), followed by _NNN.csv
     mapfile -t MODELS < <(
         ls "$OUTPUT_DIR"/*.csv 2>/dev/null \
         | xargs -I{} basename {} .csv \
-        | grep -oP '^eos[a-z0-9]+(?=_\d{3}$)' \
+        | grep -oP '^eos[a-z0-9]{4}(_v\d+)?(?=_\d{3}$)' \
         | sort -u
     )
 fi
 
 if [ ${#MODELS[@]} -eq 0 ]; then
     echo "No model output files found in $OUTPUT_DIR"
-    echo "Expected filenames: <model_id>_NNN.csv  (e.g. eos1af5_002.csv)"
+    echo "Expected filenames: <model_id>_NNN.csv  (e.g. eos1af5_v1_002.csv)"
     exit 0
 fi
 

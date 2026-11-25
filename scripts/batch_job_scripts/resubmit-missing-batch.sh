@@ -40,8 +40,7 @@ MISSING_LIST="${OUTPUT_DIR}/chunk_list_${MODEL_ID}_missing.txt"
 
 for INPUT_FILE in $(ls "$INPUT_DIR"/smiles_*.csv 2>/dev/null | sort); do
     CHUNK_NUM=$(basename "$INPUT_FILE" .csv | grep -oP '\d+$')
-    MODEL_OUT=$(echo "$MODEL_ID" | sed 's/_v[0-9]*$//')
-    OUTPUT_FILE="${OUTPUT_DIR}/${MODEL_OUT}_${CHUNK_NUM}.csv"
+    OUTPUT_FILE="${OUTPUT_DIR}/${MODEL_ID}_${CHUNK_NUM}.csv"
 
     if [ ! -f "$OUTPUT_FILE" ]; then
         echo "  MISSING : chunk_${CHUNK_NUM}"
@@ -63,6 +62,9 @@ if [ "$NUM_MISSING" -eq 0 ]; then
     rm "$MISSING_LIST"
     exit 0
 fi
+
+# Model SIFs come only from s3://models-sif; fetched once into /shared/sif-files.
+/shared/scripts/download-ersilia-model.sh "$MODEL_ID" || exit 1
 
 echo ""
 echo "Found $NUM_MISSING chunk(s) to resubmit"

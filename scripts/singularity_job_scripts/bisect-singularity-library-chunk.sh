@@ -26,10 +26,8 @@ BISECT_DIR="${OUTPUT_DIR}/bisect/${CHUNK_NUM}"
 SIF_FILE="/shared/sif-files/${MODEL_ID}.sif"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ ! -f "$SIF_FILE" ]; then
-    echo "ERROR: SIF file not found: $SIF_FILE"
-    exit 1
-fi
+# Model SIFs come only from s3://models-sif; fetched once into /shared/sif-files.
+/shared/scripts/download-ersilia-model.sh "$MODEL_ID" || exit 1
 
 if [ ! -f "$INPUT_FILE" ]; then
     echo "ERROR: Input file not found: $INPUT_FILE"

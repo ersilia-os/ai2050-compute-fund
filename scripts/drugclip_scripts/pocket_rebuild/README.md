@@ -32,6 +32,14 @@ defines it — *"residues with at least one heavy atom within a 6 Å radius of t
 `submit-pocket-encode.sh` and `stage-ligand-pockets.sh` both **refuse** to write to the
 production `targets` path, regardless of flags.
 
+**The screening set is `ai2050_targets`** (2026-11-23): `targets_ligand` (57 human) and
+`targets_mtb_v2` (10 Mtb) copied side by side, with `sets.csv` (`uniprot,set_name`) recording
+each target's original set. The screen and the docking manifest read that file, so the
+validated human results stay labelled apart from the unvalidated Mtb ones.
+`stage-ligand-pockets.sh` refuses this prefix too, because its `--delete` sync would strip
+every other target. To change a pocket: stage and encode under a new prefix, then copy the
+finished `<UNIPROT>/` folder into `ai2050_targets` and update its `sets.csv` row.
+
 ## Scripts
 
 | Script | Where | Role |
@@ -42,6 +50,7 @@ production `targets` path, regardless of flags.
 | `run-pocket-encode.sh` | cluster | sbatch job; `--max-pocket-atoms` parameterised (copy of `run-drugclip-pocket-job.sh`) |
 | `submit-pocket-encode.sh` | cluster | fan-out over a pocket base; `--clone-from` and `--max-pocket-atoms` |
 | `stage-ligand-pockets.sh` | laptop | validate + upload pre-built pockets to a new S3/FSx prefix |
+| `pocket_burial.py` | laptop | LIGSITE-style buried cavity volume at every grid centre, apo vs refined, GenPack vs template route. Reports only, no cutoff — grid defaults (0.8 Å, occupancy 2.7 Å, ≥5 of 7 enclosed axes) are untuned, so compare routes, not absolute numbers |
 
 `recover_template_ligands.py` and `pymol_pocket_session.py --mode session` need PyMOL, so run
 them with **`/home/marina/anaconda3/bin/python`**. The other two work with any Python 3 + numpy.

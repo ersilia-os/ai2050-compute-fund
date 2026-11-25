@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=drugclip-bisect
 #SBATCH --nodes=1
-#SBATCH --time=2-00:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/shared/logs/drugclip-bisect-%A_%a.out
 #SBATCH --error=/shared/logs/drugclip-bisect-%A_%a.err
 #SBATCH --open-mode=append
@@ -33,6 +33,9 @@ N_ROWS=$(( $(wc -l < "$SUB_CHUNK") - 1 ))
 
 SIF_FILE="/shared/sif-files/drugclip.sif"
 WEIGHTS_DIR="/shared/drugclip-weights"
+# Same step-1 script as run-drugclip-job.sh, so bisected pieces are prepared identically.
+LMDB_SCRIPT=${LMDB_SCRIPT:-/shared/scripts/drugclip_scripts/smiles_to_lmdb.py}
+RDKIT_TIMEOUT=${RDKIT_TIMEOUT:-60}
 
 echo "=========================================="
 echo "DrugCLIP Bisect Job"
@@ -73,9 +76,10 @@ apptainer exec \
     --bind /shared:/shared \
     --bind "${TMP_DIR}:${TMP_DIR}" \
     "$SIF_FILE" \
-    python /drugclip/smiles_to_lmdb.py \
-        --input  "$SUB_CHUNK" \
-        --output "$LMDB_PATH"
+    python "$LMDB_SCRIPT" \
+        --input   "$SUB_CHUNK" \
+        --output  "$LMDB_PATH" \
+        --timeout "$RDKIT_TIMEOUT"
 
 # ── Step 2: LMDB → H5 ────────────────────────────────────────────────────────
 if [ -d "$LMDB_PATH" ]; then

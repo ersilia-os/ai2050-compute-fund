@@ -1,0 +1,125 @@
+# Apptainer definition file for Uni-Dock (GPU Vina docking) + ligand/receptor prep
+#
+# Uni-Dock: Yu, Cai, Wang, Bo, Zhu & Zheng (2023), "Uni-Dock: GPU-Accelerated Docking
+# Enables Ultralarge Virtual Screening", J. Chem. Theory Comput., doi:10.1021/acs.jctc.2c01145
+# (citation as given in the dptech-corp/Uni-Dock README; verify the DOI before publishing).
+#
+# One image for the whole docking step:
+#   unidock 1.2.0    conda-forge, CUDA 12.9 build. Also installs unidock_tools, whose
+#                    `unidocktools proteinprep` (receptor PDB -> PDBQT) and
+#                    `unidocktools ligandprep` (3D SDF -> Uni-Dock torsion-tree SDF) are
+#                    the pipeline's prep steps
+#   dimorphite-dl    UNUSED since 2026-10-02 (ligands are docked neutral, no pH model;
+#                    dimorphite protonated aryl-NH-alkyl linkers). Still installed so this
+#                    file matches the built unidock.sif + unidock.lock; drop the pip line,
+#                    its %test block and loguru at the next rebuild.
+#   rdkit            3D embedding (prepare_ligands.py), pose RMSD (pose_rmsd.py)
+#   openbabel        bond-order perception for the reference ligand only
+#
+# CUDA: the runtime ships inside the conda env; `apptainer exec --nv` binds the host
+# driver. conda-forge only builds unidock 1.2.0 against CUDA 12.9. CUDA minor-version
+# compatibility should let it run on any 12.x-era driver (>= 525), but check the driver
+# on gpu-queue first. If the 12.9 build fails with an "insufficient driver" error, rebuild
+# with the fallback pins in %post (unidock 1.1.3, CUDA 12.6).
+#
+# GPUs: Uni-Dock's CMakeLists compiles sm_75 (T4) and sm_89 (L4, L40S), so every
+# instance type behind gpu-queue is covered.
+#
+# Scripts (prepare_ligands.py, compute_box.py, pose_rmsd.py, test-unidock.sh) are NOT baked in. They run from
+# /shared/scripts/docking_scripts/ via the /shared bind, so editing them needs an rsync,
+# not a rebuild.
+#
+# Build (from repo root, locally):
+#   apptainer build unidock.sif scripts/docking_scripts/unidock.def
+#   apptainer exec unidock.sif cat /opt/unidock.lock > scripts/docking_scripts/unidock.lock
+#
+# Upload to S3, then stage on the cluster (from the AL2023 head node):
+#   aws s3 cp unidock.sif s3://ai2050-ersilia-cluster/sif-files/unidock.sif
+#   aws s3 cp s3://ai2050-ersilia-cluster/sif-files/unidock.sif /shared/sif-files/unidock.sif
+
+Bootstrap: docker
+From: condaforge/miniforge3:26.7.2-0
+
+%post
+    set -e
+
+    # The cuda129 builds depend on the __cuda virtual package; the build host may have
+    # no NVIDIA driver, so declare it explicitly for the solver.
+    export CONDA_OVERRIDE_CUDA=12.9
+
+    # unidock 1.2.0 is built against libboost 1.88, and the first rdkit built against
+    # it is 2026.03. dimorphite-dl 2.0.2 declares rdkit<2026, so conda cannot solve the
+    # two together. That cap predates rdkit 2026 (2.0.2 was released 2025-08) and is
+    # precautionary, not a known incompatibility. dimorphite-dl is pure Python, so it is
+    # pip-installed below WITHOUT its dependency pins, and %test checks known answers so
+    # a real incompatibility fails the build. Do not downgrade unidock to get around this:
+    # 1.2.0 fixes a --gpu_batch CUDA error 700 and a grid overflow that silently corrupted
+    # results for large boxes (CHANGELOG 1.2.0).
+    #
+    # openbabel must be 3.2.1: every 3.1.1 build caps libxml2 <2.14, which pins an
+    # older ICU than the Boost 1.88 / rdkit 2026 stack (ICU 78) allows.
+    #
+    # This exact set was dry-run solved locally on 2026-10-02 (conda --solver=libmamba,
+    # CONDA_OVERRIDE_CUDA=12.9): unidock 1.2.0 cuda129_h426df62_1, rdkit 2026.03.1,
+    # libboost 1.88.0, icu 78.3, libxml2 2.15.4, openbabel 3.2.1, python 3.11.16.
+    mamba create -y -p /opt/unidock -c conda-forge --strict-channel-priority \
+        python=3.11 \
+        pip \
+        "unidock=1.2.0=cuda129*" \
+        cuda-version=12.9 \
+        rdkit=2026.03 \
+        openbabel=3.2.1 \
+        "loguru>=0.7.2,<0.8"
+
+    /opt/unidock/bin/python -m pip install --no-cache-dir --no-deps dimorphite-dl==2.0.2
+
+    # Fallback if the gpu-queue driver cannot run CUDA 12.9 builds:
+    #   export CONDA_OVERRIDE_CUDA=12.6
+    #   ... "unidock=1.1.3=cuda126*" cuda-version=12.6 ...
+
+    # Provenance: exact package URLs + hashes; recreate with
+    #   mamba create -p <env> --file unidock.lock
+    conda list -p /opt/unidock --explicit --md5 > /opt/unidock.lock
+    echo "# pip (installed with --no-deps): dimorphite-dl==2.0.2" >> /opt/unidock.lock
+
+    conda clean -afy
+
+%environment
+    export PATH="/opt/unidock/bin:$PATH"
+
+%test
+    set -e
+    export PATH="/opt/unidock/bin:$PATH"
+    command -v unidock
+    # No GPU at build time, so check linkage rather than running a dock. libcuda.so.1
+    # comes from the host driver via --nv and is expected to be missing here.
+    if ldd "$(command -v unidock)" | grep "not found" | grep -v "libcuda.so"; then
+        echo "unidock has unresolved shared libraries"; exit 1
+    fi
+    python -c "import rdkit, dimorphite_dl; from openbabel import pybel; print('rdkit', rdkit.__version__)"
+    # Known answers at pH 7.4 with the pipeline's settings (dimorphite-dl on rdkit 2026
+    # is outside its declared range, so check it actually behaves):
+    #   acetic acid (pKa ~4.8) -> acetate; ethylamine (pKa ~10.6) -> ammonium;
+    #   pyridine (pKa ~5.2) -> stays neutral
+    python - << 'PYEOF'
+from dimorphite_dl import protonate_smiles
+def state(smi):
+    out = protonate_smiles(smi, ph_min=7.4, ph_max=7.4, precision=0.0, max_variants=1)
+    assert len(out) == 1, f"{smi}: expected one state, got {out}"
+    return out[0]
+checks = {"CC(=O)O": lambda s: "[O-]" in s,
+          "CCN": lambda s: "[NH3+]" in s,
+          "c1ccncc1": lambda s: "+" not in s and "-" not in s}
+for smi, ok in checks.items():
+    s = state(smi)
+    assert ok(s), f"dimorphite-dl gave an unexpected state for {smi}: {s}"
+    print(f"dimorphite-dl OK: {smi} -> {s}")
+PYEOF
+    obabel -V
+    unidocktools proteinprep --help > /dev/null
+    unidocktools ligandprep --help > /dev/null
+
+%labels
+    Author ersilia
+    Version 1.0
+    Description Uni-Dock 1.2.0 GPU docking (Vina scoring) with unidock_tools prep, dimorphite-dl, rdkit, openbabel

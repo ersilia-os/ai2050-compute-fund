@@ -8,15 +8,15 @@
 # SIF    : /shared/sif-files/<model_id>.sif
 #
 # Example:
-#   bash submit-batch.sh eos1af5
-#   bash submit-batch.sh eos1af5 cpu-queue
+#   bash submit-batch.sh eos1af5_v1
+#   bash submit-batch.sh eos1af5_v1 cpu-queue
 
 MODEL_ID=$1
 QUEUE=${2:-cpu-queue}
 
 if [ -z "$MODEL_ID" ]; then
     echo "Usage: $0 <model_id> [queue]"
-    echo "Example: $0 eos1af5 cpu-queue"
+    echo "Example: $0 eos1af5_v1 cpu-queue"
     exit 1
 fi
 
@@ -29,11 +29,8 @@ if [ ! -d "$INPUT_DIR" ]; then
     exit 1
 fi
 
-if [ ! -f "/shared/sif-files/${MODEL_ID}.sif" ]; then
-    echo "ERROR: SIF file not found: /shared/sif-files/${MODEL_ID}.sif"
-    echo "Download it first: /shared/scripts/download-ersilia-model.sh $MODEL_ID"
-    exit 1
-fi
+# Model SIFs come only from s3://models-sif; fetched once into /shared/sif-files.
+/shared/scripts/download-ersilia-model.sh "$MODEL_ID" || exit 1
 
 mkdir -p "$OUTPUT_DIR"
 
